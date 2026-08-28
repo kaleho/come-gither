@@ -48,6 +48,22 @@ export interface PushSummary {
 	commit: string | null;
 }
 
+export type IncomingAction =
+	| "fetch"
+	| "placeholder"
+	| "delete"
+	| "both-changed"
+	| "keep-local"
+	| "adopt"
+	| "overwrite";
+export type OutgoingAction = "new" | "modified" | "deleted" | "skip-oversize" | "skip-placeholder";
+
+export interface SyncPlan {
+	headMoved: boolean;
+	incoming: { path: string; action: IncomingAction }[];
+	outgoing: { path: string; action: OutgoingAction }[];
+}
+
 export type LogFn = (level: "info" | "warn" | "error", message: string) => void;
 
 interface RemoteBlob {
@@ -103,6 +119,80 @@ export class SyncEngine {
 		await this.state.flush();
 		this.log("info", `evicted ${path}; the placeholder stays until you download it again`);
 		return "evicted";
+	}
+
+	/** Read-only classification of what the next sync would do. Fetches no blobs, writes nothing. */
+	async preview(): Promise<SyncPlan> {
+		const plan: SyncPlan = { headMoved: false, incoming: [], outgoing: [] };
+		const head = await this.gh.getRef(this.config.branch);
+		if (head !== this.state.state.lastSyncedCommit) {
+			plan.headMoved = true;
+			const { treeSha } = await this.gh.getCommit(head);
+			const remote = await this.listRemote(treeSha);
+			for (const [path, blob] of remote) {
+				if (this.excluded(path)) continue;
+				const entry = this.state.state.files[path];
+				if (entry && entry.baseBlobSha === blob.sha) continue;
+				const localSha = await this.localShaIfChanged(path, entry, false);
+				let action: IncomingAction;
+				if (localSha === "clean") action = this.isLazyTarget(path, blob.size) ? "placeholder" : "fetch";
+				else if (localSha === blob.sha) action = "adopt";
+				else if (path.startsWith(".obsidian/") || this.config.conflictPolicy === "remote-wins") action = "overwrite";
+				else action = "both-changed";
+				plan.incoming.push({ path, action });
+			}
+			for (const path of Object.keys(this.state.state.files)) {
+				if (remote.has(path) || this.excluded(path)) continue;
+				const localSha = await this.localShaIfChanged(path, this.state.state.files[path], false);
+				plan.incoming.push({ path, action: localSha === "clean" ? "delete" : "keep-local" });
+			}
+		}
+		const localPaths = new Set(
+			(await this.files.listRecursive("")).filter((p) => !this.excluded(p)),
+		);
+		for (const path of localPaths) {
+			const entry = this.state.state.files[path];
+			const localSha = await this.localShaIfChanged(path, entry, false);
+			if (localSha === "clean") continue;
+			if (entry?.lazy) {
+				plan.outgoing.push({ path, action: "skip-placeholder" });
+				continue;
+			}
+			const stat = (await this.files.stat(path)) as { size: number };
+			plan.outgoing.push({
+				path,
+				action: stat.size > this.config.maxPushBytes ? "skip-oversize" : entry ? "modified" : "new",
+			});
+		}
+		for (const path of Object.keys(this.state.state.files)) {
+			const entry = this.state.state.files[path];
+			if (localPaths.has(path) || entry.lazy) continue;
+			plan.outgoing.push({ path, action: "deleted" });
+		}
+		return plan;
+	}
+
+	/** Discard a local change: restore the last-synced content (or stub), or delete a new file. */
+	async revert(path: string): Promise<"reverted" | "clean"> {
+		const entry = this.state.state.files[path];
+		if (!entry) {
+			if ((await this.files.stat(path)) === null) return "clean";
+			await this.files.remove(path);
+			this.log("info", `reverted ${path}: removed the new file`);
+			return "reverted";
+		}
+		if ((await this.localShaIfChanged(path, entry, false)) === "clean") return "clean";
+		if (entry.lazy) {
+			await this.files.writeBinary(path, new ArrayBuffer(0));
+			await this.record(path, entry.baseBlobSha, true, entry.remoteSize);
+		} else {
+			const data = await this.gh.getBlobRaw(entry.baseBlobSha);
+			await this.files.writeBinary(path, data);
+			await this.record(path, entry.baseBlobSha, false);
+		}
+		await this.state.flush();
+		this.log("info", `reverted ${path} to its last-synced content`);
+		return "reverted";
 	}
 
 	async push(): Promise<PushSummary> {
@@ -247,7 +337,7 @@ export class SyncEngine {
 			}
 			// remote-wins policy, and .obsidian/ always: fall through and overwrite.
 		}
-		if (blob.size > this.config.maxAutoFetchBytes || (!this.isText(path) && !path.startsWith(".obsidian/"))) {
+		if (this.isLazyTarget(path, blob.size)) {
 			await this.files.writeBinary(path, new ArrayBuffer(0));
 			await this.record(path, blob.sha, true, blob.size);
 			summary.placeholders += 1;
@@ -308,6 +398,7 @@ export class SyncEngine {
 	private async localShaIfChanged(
 		path: string,
 		entry: FileEntry | undefined,
+		refresh = true,
 	): Promise<string> {
 		const stat = await this.files.stat(path);
 		if (!entry) {
@@ -318,7 +409,9 @@ export class SyncEngine {
 		if (stat.mtime === entry.mtime && stat.size === entry.size) return "clean";
 		const sha = await gitBlobSha1(await this.files.readBinary(path));
 		if (sha === entry.baseBlobSha) {
-			await this.record(path, entry.baseBlobSha, entry.lazy === true, entry.remoteSize); // refresh fingerprint
+			if (refresh) {
+				await this.record(path, entry.baseBlobSha, entry.lazy === true, entry.remoteSize); // refresh fingerprint
+			}
 			return "clean";
 		}
 		return sha;
@@ -359,6 +452,10 @@ export class SyncEngine {
 			if (e.type === "blob") out.set(`${prefix}${e.path}`, { sha: e.sha as string, size: e.size as number });
 			else await this.walk(e.sha as string, `${prefix}${e.path}/`, out);
 		}
+	}
+
+	private isLazyTarget(path: string, size: number): boolean {
+		return size > this.config.maxAutoFetchBytes || (!this.isText(path) && !path.startsWith(".obsidian/"));
 	}
 
 	private excluded(path: string): boolean {

@@ -566,3 +566,165 @@ describe("remote size on lazy entries", () => {
 		expect(state.state.files["big.pdf"].lazy).toBe(true);
 	});
 });
+
+describe("preview", () => {
+	it("classifies incoming and outgoing changes without touching anything", async () => {
+		const { gh, files, state, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one", "b.md": "two", "c.md": "three", "big.pdf": new Uint8Array(9) });
+		await engine.pull();
+		// outgoing: modify a.md, create new.md, delete c.md
+		await files.writeBinary("a.md", text("one EDITED"));
+		await files.writeBinary("new.md", text("brand new"));
+		await files.remove("c.md");
+		// incoming: change b.md remotely, add remote-new.md, keep the rest
+		await gh.setFiles({ "a.md": "one", "b.md": "TWO", "c.md": "three", "big.pdf": new Uint8Array(9), "remote-new.md": "hi" });
+		gh.blobFetches.length = 0;
+		const stateJson = files.readText(STATE_PATH);
+		const plan = await engine.preview();
+		expect(plan.headMoved).toBe(true);
+		expect(plan.incoming).toEqual(
+			expect.arrayContaining([
+				{ path: "b.md", action: "fetch" },
+				{ path: "remote-new.md", action: "fetch" },
+			]),
+		);
+		expect(plan.incoming.length).toBe(2);
+		expect(plan.outgoing).toEqual(
+			expect.arrayContaining([
+				{ path: "a.md", action: "modified" },
+				{ path: "new.md", action: "new" },
+				{ path: "c.md", action: "deleted" },
+			]),
+		);
+		expect(plan.outgoing.length).toBe(3);
+		// read-only: no blob downloads, no file writes, no state change
+		expect(gh.blobFetches).toEqual([]);
+		expect(files.readText("a.md")).toBe("one EDITED");
+		expect(files.readText(STATE_PATH)).toBe(stateJson);
+	});
+
+	it("marks both-changed files and placeholder skips", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "base", "big.pdf": new Uint8Array([1, 2, 3]) });
+		await engine.pull();
+		await files.writeBinary("a.md", text("local"));
+		await files.writeBinary("big.pdf", text("scribble"));
+		await gh.setFiles({ "a.md": "remote", "big.pdf": new Uint8Array([1, 2, 3]) });
+		const plan = await engine.preview();
+		expect(plan.incoming).toEqual([{ path: "a.md", action: "both-changed" }]);
+		expect(plan.outgoing).toEqual(expect.arrayContaining([{ path: "big.pdf", action: "skip-placeholder" }]));
+	});
+
+	it("reports an unmoved head with no incoming rows", async () => {
+		const { gh, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one" });
+		await engine.pull();
+		const plan = await engine.preview();
+		expect(plan.headMoved).toBe(false);
+		expect(plan.incoming).toEqual([]);
+		expect(plan.outgoing).toEqual([]);
+	});
+
+	it("classifies remote deletions and new remote binaries", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one", "b.md": "two" });
+		await engine.pull();
+		await gh.setFiles({ "a.md": "one", "img.png": new Uint8Array(5) });
+		const plan = await engine.preview();
+		expect(plan.incoming).toEqual(
+			expect.arrayContaining([
+				{ path: "b.md", action: "delete" },
+				{ path: "img.png", action: "placeholder" },
+			]),
+		);
+		expect(await files.stat("b.md")).not.toBeNull();
+	});
+});
+
+describe("preview: remaining classifications", () => {
+	it("classifies adopt, overwrite, keep-local, oversize and skips excluded paths", async () => {
+		const { gh, files, engine } = makeEngine({ maxPushBytes: 15 });
+		await gh.setFiles({ "a.md": "base", ".obsidian/app.json": "{}", "gone.md": "bye" });
+		await engine.pull();
+		// adopt: local already holds the new remote content
+		await files.writeBinary("a.md", text("same-on-both"));
+		// overwrite: .obsidian both-changed is pinned remote-wins
+		await files.writeBinary(".obsidian/app.json", text("{local}"));
+		// keep-local: gone.md deleted remotely but changed locally
+		await files.writeBinary("gone.md", text("bye EDITED"));
+		// oversize outgoing
+		await files.writeBinary("big-note.md", text("way past eight bytes"));
+		await gh.setFiles({
+			"a.md": "same-on-both",
+			".obsidian/app.json": "{remote}",
+			"_conflicts/junk.md": "ignore me",
+		});
+		const plan = await engine.preview();
+		expect(plan.incoming).toEqual(
+			expect.arrayContaining([
+				{ path: "a.md", action: "adopt" },
+				{ path: ".obsidian/app.json", action: "overwrite" },
+				{ path: "gone.md", action: "keep-local" },
+			]),
+		);
+		expect(plan.incoming.find((r) => r.path.startsWith("_conflicts/"))).toBeUndefined();
+		expect(plan.outgoing).toEqual(
+			expect.arrayContaining([
+				{ path: "big-note.md", action: "skip-oversize" },
+				{ path: "gone.md", action: "modified" },
+			]),
+		);
+	});
+});
+
+describe("revert", () => {
+	it("reports an unknown absent path as clean", async () => {
+		const { engine } = makeEngine();
+		expect(await engine.revert("never-existed.md")).toBe("clean");
+	});
+
+	it("restores the last-synced content of a modified file", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "base" });
+		await engine.pull();
+		await files.writeBinary("a.md", text("edited"));
+		expect(await engine.revert("a.md")).toBe("reverted");
+		expect(files.readText("a.md")).toBe("base");
+		expect((await engine.push()).commit).toBe(null);
+	});
+
+	it("deletes a new untracked file", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "base" });
+		await engine.pull();
+		await files.writeBinary("new.md", text("scratch"));
+		expect(await engine.revert("new.md")).toBe("reverted");
+		expect(await files.stat("new.md")).toBeNull();
+	});
+
+	it("restores a locally deleted file", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "base" });
+		await engine.pull();
+		await files.remove("a.md");
+		expect(await engine.revert("a.md")).toBe("reverted");
+		expect(files.readText("a.md")).toBe("base");
+	});
+
+	it("restores the stub for a modified placeholder", async () => {
+		const { gh, files, state, engine } = makeEngine();
+		await gh.setFiles({ "big.pdf": new Uint8Array([1, 2, 3]) });
+		await engine.pull();
+		await files.writeBinary("big.pdf", text("scribble"));
+		expect(await engine.revert("big.pdf")).toBe("reverted");
+		expect((await files.stat("big.pdf"))?.size).toBe(0);
+		expect(state.state.files["big.pdf"].lazy).toBe(true);
+	});
+
+	it("reports a clean file as clean and persists nothing new", async () => {
+		const { gh, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "base" });
+		await engine.pull();
+		expect(await engine.revert("a.md")).toBe("clean");
+	});
+});
