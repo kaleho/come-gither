@@ -8,7 +8,7 @@
 		"allowJs": true,
 		"noImplicitAny": true,
 		"strict": true,
-		"moduleResolution": "node",
+		"moduleResolution": "bundler",
 		"importHelpers": false,
 		"isolatedModules": true,
 		"esModuleInterop": true,
