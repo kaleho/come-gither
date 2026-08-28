@@ -91,6 +91,104 @@ export class MemFiles implements Files {
 	}
 }
 
+/** Git blob SHA-1 of raw bytes, independent of the implementation under test. */
+export async function gitSha(data: Uint8Array | string): Promise<string> {
+	const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+	const header = new TextEncoder().encode(`blob ${bytes.length}\0`);
+	const full = new Uint8Array(header.length + bytes.length);
+	full.set(header);
+	full.set(bytes, header.length);
+	const digest = await crypto.subtle.digest("SHA-1", full);
+	return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+interface RemoteFile {
+	sha: string;
+	size: number;
+	bytes: Uint8Array;
+}
+
+/** In-memory GitHub remote: one head commit over a flat set of files. */
+export class FakeGitHub {
+	head = "commit-0";
+	filesByPath = new Map<string, RemoteFile>();
+	blobFetches: string[] = [];
+	treeFetches: string[] = [];
+	failNextBlobFetches = 0;
+	truncateRecursive = false;
+	private commitCounter = 0;
+
+	async setFiles(contents: Record<string, Uint8Array | string>): Promise<void> {
+		this.filesByPath.clear();
+		for (const [path, data] of Object.entries(contents)) {
+			const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+			this.filesByPath.set(path, { sha: await gitSha(bytes), size: bytes.length, bytes });
+		}
+		this.head = `commit-${++this.commitCounter}`;
+	}
+
+	async getRef(_branch: string): Promise<string> {
+		return this.head;
+	}
+
+	async getCommit(sha: string): Promise<{ treeSha: string; parents: string[] }> {
+		return { treeSha: `tree-of-${sha}`, parents: [] };
+	}
+
+	async getTree(sha: string, recursive: boolean) {
+		this.treeFetches.push(`${sha}:${recursive}`);
+		const blob = (path: string, f: RemoteFile) => ({
+			path,
+			mode: "100644",
+			type: "blob" as const,
+			sha: f.sha,
+			size: f.size,
+		});
+		if (recursive) {
+			if (this.truncateRecursive) return { entries: [], truncated: true };
+			// Real recursive listings include tree rows alongside blobs.
+			const dirs = new Set<string>();
+			for (const p of this.filesByPath.keys()) {
+				const parts = p.split("/").slice(0, -1);
+				for (let i = 1; i <= parts.length; i++) dirs.add(parts.slice(0, i).join("/"));
+			}
+			return {
+				entries: [
+					...[...dirs].map((d) => ({ path: d, mode: "040000", type: "tree" as const, sha: `dir:${d}/` })),
+					...[...this.filesByPath.entries()].map(([p, f]) => blob(p, f)),
+				],
+				truncated: false,
+			};
+		}
+		// Non-recursive: one level under the directory the tree sha names.
+		const prefix = sha.startsWith("dir:") ? sha.slice(4) : "";
+		const seen = new Map<string, ReturnType<typeof blob> | { path: string; mode: string; type: "tree"; sha: string; size?: number }>();
+		for (const [p, f] of this.filesByPath) {
+			if (!p.startsWith(prefix)) continue;
+			const rest = p.slice(prefix.length);
+			const slash = rest.indexOf("/");
+			if (slash === -1) seen.set(rest, blob(rest, f));
+			else {
+				const dir = rest.slice(0, slash);
+				seen.set(dir, { path: dir, mode: "040000", type: "tree", sha: `dir:${prefix}${dir}/` });
+			}
+		}
+		return { entries: [...seen.values()], truncated: false };
+	}
+
+	async getBlobRaw(sha: string): Promise<ArrayBuffer> {
+		if (this.failNextBlobFetches > 0) {
+			this.failNextBlobFetches -= 1;
+			throw new Error("network dropped");
+		}
+		this.blobFetches.push(sha);
+		for (const f of this.filesByPath.values()) {
+			if (f.sha === sha) return f.bytes.slice().buffer as ArrayBuffer;
+		}
+		throw new Error(`no blob ${sha}`);
+	}
+}
+
 /** Virtual clock: sleep() advances time instantly and records the delay. */
 export class FakeClock {
 	t = 0;
