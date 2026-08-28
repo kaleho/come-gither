@@ -1,3 +1,4 @@
+import { GitHubError } from "./github";
 import type { Files } from "./ports";
 import type { FileEntry, StateStore } from "./state";
 
@@ -9,12 +10,17 @@ export interface GitHubApi {
 		recursive: boolean,
 	): Promise<{ entries: { path: string; mode: string; type: "blob" | "tree"; sha: string | null; size?: number }[]; truncated: boolean }>;
 	getBlobRaw(sha: string): Promise<ArrayBuffer>;
+	createBlob(data: ArrayBuffer): Promise<string>;
+	createTree(baseTree: string, entries: { path: string; mode: string; type: "blob" | "tree"; sha: string | null }[]): Promise<string>;
+	createCommit(message: string, treeSha: string, parents: string[]): Promise<string>;
+	updateRef(branch: string, sha: string): Promise<void>;
 }
 
 export interface SyncConfig {
 	branch: string;
 	textExtensions: string[];
 	maxAutoFetchBytes: number;
+	maxPushBytes: number;
 }
 
 export const DEFAULT_TEXT_EXTENSIONS = [
@@ -30,6 +36,13 @@ export interface PullSummary {
 	adopted: number;
 	deleted: number;
 	conflicts: number;
+}
+
+export interface PushSummary {
+	pushed: number;
+	deletedRemote: number;
+	skipped: number;
+	commit: string | null;
 }
 
 export type LogFn = (level: "info" | "warn" | "error", message: string) => void;
@@ -57,6 +70,84 @@ export class SyncEngine {
 		private log: LogFn,
 		private config: SyncConfig,
 	) {}
+
+	async push(): Promise<PushSummary> {
+		const summary: PushSummary = { pushed: 0, deletedRemote: 0, skipped: 0, commit: null };
+		const treeEntries: { path: string; mode: string; type: "blob"; sha: string | null }[] = [];
+		const localPaths = new Set(
+			(await this.files.listRecursive("")).filter((p) => !this.excluded(p)),
+		);
+
+		for (const path of localPaths) {
+			const entry = this.state.state.files[path];
+			const localSha = await this.localShaIfChanged(path, entry);
+			if (localSha === "clean") continue;
+			if (entry?.lazy) {
+				summary.skipped += 1;
+				this.log("warn", `${path} is an unfetched placeholder that was modified locally; not pushing it`);
+				continue;
+			}
+			const stat = (await this.files.stat(path)) as { size: number };
+			if (stat.size > this.config.maxPushBytes) {
+				summary.skipped += 1;
+				this.log("warn", `${path} is ${stat.size} bytes, over the push limit; push it from desktop git`);
+				continue;
+			}
+			const sha = await this.gh.createBlob(await this.files.readBinary(path));
+			treeEntries.push({ path, mode: "100644", type: "blob", sha });
+			summary.pushed += 1;
+		}
+
+		const droppedPaths: string[] = [];
+		for (const path of Object.keys(this.state.state.files)) {
+			if (localPaths.has(path)) continue;
+			if (this.state.state.files[path].lazy) {
+				// A deleted placeholder must never delete the real remote file.
+				droppedPaths.push(path);
+				continue;
+			}
+			treeEntries.push({ path, mode: "100644", type: "blob", sha: null });
+			droppedPaths.push(path);
+			summary.deletedRemote += 1;
+		}
+
+		if (treeEntries.length === 0) {
+			for (const path of droppedPaths) await this.state.removeFile(path);
+			return summary;
+		}
+
+		const base = this.state.state.lastSyncedCommit as string;
+		const { treeSha: baseTree } = await this.gh.getCommit(base);
+		const newTree = await this.gh.createTree(baseTree, treeEntries);
+		const commit = await this.gh.createCommit(
+			`come-gither: sync (${summary.pushed} changed, ${summary.deletedRemote} deleted)`,
+			newTree,
+			[base],
+		);
+		await this.gh.updateRef(this.config.branch, commit);
+
+		for (const e of treeEntries) {
+			if (e.sha !== null) await this.record(e.path, e.sha, false);
+		}
+		for (const path of droppedPaths) await this.state.removeFile(path);
+		await this.state.setCommit(commit);
+		summary.commit = commit;
+		this.log("info", `push done: ${summary.pushed} pushed, ${summary.deletedRemote} deleted, ${summary.skipped} skipped`);
+		return summary;
+	}
+
+	async sync(attempt = 1): Promise<{ pull: PullSummary; push: PushSummary }> {
+		const pull = await this.pull();
+		try {
+			return { pull, push: await this.push() };
+		} catch (e) {
+			if (e instanceof GitHubError && e.kind === "not-fast-forward" && attempt < 3) {
+				this.log("warn", "the branch moved during the push; pulling again and retrying");
+				return this.sync(attempt + 1);
+			}
+			throw e;
+		}
+	}
 
 	async pull(): Promise<PullSummary> {
 		const summary: PullSummary = {

@@ -1,3 +1,4 @@
+import { GitHubError } from "../src/github";
 import type { Http, HttpRequest, HttpResponse } from "../src/ports";
 
 type Rule = {
@@ -174,6 +175,45 @@ export class FakeGitHub {
 			}
 		}
 		return { entries: [...seen.values()], truncated: false };
+	}
+
+	createdBlobs = new Map<string, Uint8Array>();
+	pushedTrees: { baseTree: string; entries: { path: string; mode: string; type: string; sha: string | null }[] }[] = [];
+	pushedCommits = new Map<string, { parents: string[]; message: string }>();
+	failUpdateRefTimes = 0;
+	private pushCounter = 0;
+
+	async createBlob(data: ArrayBuffer): Promise<string> {
+		const bytes = new Uint8Array(data);
+		const sha = await gitSha(bytes);
+		this.createdBlobs.set(sha, bytes);
+		return sha;
+	}
+
+	async createTree(
+		baseTree: string,
+		entries: { path: string; mode: string; type: "blob" | "tree"; sha: string | null }[],
+	): Promise<string> {
+		this.pushedTrees.push({ baseTree, entries });
+		return `tree-push-${++this.pushCounter}`;
+	}
+
+	async createCommit(message: string, _treeSha: string, parents: string[]): Promise<string> {
+		const sha = `commit-push-${this.pushCounter}`;
+		this.pushedCommits.set(sha, { parents, message });
+		return sha;
+	}
+
+	async updateRef(_branch: string, sha: string): Promise<void> {
+		if (this.failUpdateRefTimes > 0) {
+			this.failUpdateRefTimes -= 1;
+			throw new GitHubError(422, "not-fast-forward", "fake: ref moved");
+		}
+		const commit = this.pushedCommits.get(sha);
+		if (!commit || commit.parents[0] !== this.head) {
+			throw new GitHubError(422, "not-fast-forward", "fake: not a fast forward");
+		}
+		this.head = sha;
 	}
 
 	async getBlobRaw(sha: string): Promise<ArrayBuffer> {
