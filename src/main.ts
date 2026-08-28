@@ -47,10 +47,18 @@ const MAX_PUSH_BYTES = 30 * 1048576;
 
 class ObsidianHttp implements Http {
 	async request(req: HttpRequest): Promise<HttpResponse> {
+		const method = req.method ?? "GET";
+		let url = req.url;
+		if (method === "GET") {
+			// The iOS URL cache honors GitHub's max-age=60 and serves stale refs
+			// for up to a minute after a push, which breaks fast-forward updates.
+			// Bust the cache per request and ask the cache layer to revalidate.
+			url += (url.includes("?") ? "&" : "?") + `cb=${Date.now()}`;
+		}
 		const res = await requestUrl({
-			url: req.url,
-			method: req.method ?? "GET",
-			headers: req.headers,
+			url,
+			method,
+			headers: { "Cache-Control": "no-cache", ...req.headers },
 			body: req.body,
 			throw: false,
 		});
