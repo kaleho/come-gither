@@ -1,7 +1,7 @@
 {
 	"id": "come-gither",
 	"name": "Come Gither",
-	"version": "0.2.2",
+	"version": "0.3.0",
 	"minAppVersion": "1.5.0",
 	"description": "Sync your vault with a GitHub repository through the GitHub API. Works on mobile. No local git needed.",
 	"author": "Ray Kaleho",

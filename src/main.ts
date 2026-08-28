@@ -16,6 +16,7 @@ import { RingLogger } from "./log";
 import type { Files, Http, HttpRequest, HttpResponse } from "./ports";
 import { StateStore } from "./state";
 import { DEFAULT_TEXT_EXTENSIONS, SyncEngine } from "./sync";
+import type { SyncPlan } from "./sync";
 
 interface ComeGitherSettings {
 	owner: string;
@@ -165,6 +166,110 @@ class PlaceholderView extends ItemView {
 	}
 }
 
+const PREVIEW_VIEW = "come-gither-preview";
+
+const INCOMING_LABELS: Record<string, string> = {
+	fetch: "Will download",
+	placeholder: "Placeholder will be added",
+	delete: "Will be deleted here",
+	"both-changed": "Conflict: merge will be tried",
+	"keep-local": "Deleted on GitHub, kept here",
+	adopt: "Already identical",
+	overwrite: "GitHub version will be taken",
+};
+const OUTGOING_LABELS: Record<string, string> = {
+	new: "New file",
+	modified: "Changed",
+	deleted: "Will be deleted on GitHub",
+	"skip-oversize": "Skipped: too large to push",
+	"skip-placeholder": "Skipped: modified placeholder",
+};
+const REVERTIBLE = new Set(["new", "modified", "deleted"]);
+
+class PreviewView extends ItemView {
+	constructor(
+		leaf: WorkspaceLeaf,
+		private plugin: ComeGitherPlugin,
+	) {
+		super(leaf);
+	}
+
+	getViewType(): string {
+		return PREVIEW_VIEW;
+	}
+
+	getDisplayText(): string {
+		return "Sync preview";
+	}
+
+	getIcon(): string {
+		return "git-compare";
+	}
+
+	async onOpen(): Promise<void> {
+		await this.reload();
+	}
+
+	async reload(): Promise<void> {
+		const el = this.contentEl;
+		el.empty();
+		el.createEl("p", { text: "Checking…" });
+		let plan: SyncPlan;
+		try {
+			plan = await this.plugin.previewPlan();
+		} catch (e) {
+			el.empty();
+			el.createEl("p", { text: `Preview failed: ${e instanceof Error ? e.message : String(e)}` });
+			return;
+		}
+		el.empty();
+		const root = el.createDiv({ cls: "come-gither-preview" });
+
+		const header = root.createDiv({ cls: "come-gither-preview-actions" });
+		const syncBtn = header.createEl("button", { text: "Sync now" });
+		syncBtn.addClass("mod-cta");
+		syncBtn.addEventListener("click", () => {
+			void this.plugin.runSync().then(() => this.reload());
+		});
+		const refreshBtn = header.createEl("button", { text: "Refresh" });
+		refreshBtn.addEventListener("click", () => void this.reload());
+
+		if (plan.incoming.length === 0 && plan.outgoing.length === 0) {
+			root.createEl("p", { text: "Nothing to sync. Everything matches GitHub." });
+			return;
+		}
+
+		this.section(root, `Incoming from GitHub (${plan.incoming.length})`, plan.incoming, INCOMING_LABELS, null);
+		this.section(root, `Outgoing to GitHub (${plan.outgoing.length})`, plan.outgoing, OUTGOING_LABELS, (row, item) => {
+			if (!REVERTIBLE.has(item.action)) return;
+			const btn = row.createEl("button", { text: "Revert" });
+			btn.addEventListener("click", () => {
+				btn.disabled = true;
+				void this.plugin.revertPath(item.path).then(() => this.reload());
+			});
+		});
+	}
+
+	private section(
+		root: HTMLElement,
+		title: string,
+		items: { path: string; action: string }[],
+		labels: Record<string, string>,
+		extra: ((row: HTMLElement, item: { path: string; action: string }) => void) | null,
+	): void {
+		if (items.length === 0) return;
+		root.createEl("h4", { text: title });
+		const list = root.createDiv({ cls: "come-gither-preview-list" });
+		for (const item of items) {
+			const row = list.createDiv({ cls: "come-gither-preview-row" });
+			const info = row.createDiv({ cls: "come-gither-preview-info" });
+			info.createDiv({ cls: "come-gither-preview-path", text: item.path });
+			info.createDiv({ cls: "come-gither-preview-action", text: labels[item.action] ?? item.action });
+			if (extra) extra(row, item);
+		}
+	}
+}
+
 export default class ComeGitherPlugin extends Plugin {
 	settings: ComeGitherSettings = { ...DEFAULT_SETTINGS };
 	private logger!: RingLogger;
@@ -182,6 +287,7 @@ export default class ComeGitherPlugin extends Plugin {
 		this.setStatus("idle");
 
 		this.registerView(PLACEHOLDER_VIEW, (leaf) => new PlaceholderView(leaf, this));
+		this.registerView(PREVIEW_VIEW, (leaf) => new PreviewView(leaf, this));
 		this.addSettingTab(new ComeGitherSettingTab(this.app, this));
 
 		this.addCommand({
@@ -193,6 +299,11 @@ export default class ComeGitherPlugin extends Plugin {
 			id: "export-log",
 			name: "Export sync log",
 			callback: () => void this.exportLog(),
+		});
+		this.addCommand({
+			id: "preview-sync",
+			name: "Preview sync",
+			callback: () => void this.openPreview(),
 		});
 		this.addCommand({
 			id: "evict-file",
@@ -262,7 +373,38 @@ export default class ComeGitherPlugin extends Plugin {
 		});
 	}
 
-	private async runSync(startup = false): Promise<void> {
+	async openPreview(): Promise<void> {
+		const existing = this.app.workspace.getLeavesOfType(PREVIEW_VIEW)[0];
+		if (existing) {
+			await this.app.workspace.revealLeaf(existing);
+			await (existing.view as PreviewView).reload();
+			return;
+		}
+		await this.app.workspace.getLeaf(true).setViewState({ type: PREVIEW_VIEW, active: true });
+	}
+
+	async previewPlan(): Promise<SyncPlan> {
+		const engine = await this.makeEngine();
+		return engine.preview();
+	}
+
+	async revertPath(path: string): Promise<void> {
+		try {
+			const engine = await this.makeEngine();
+			const result = await engine.revert(path);
+			new Notice(
+				result === "reverted"
+					? `Come Gither: reverted ${path}.`
+					: `Come Gither: ${path} has no local changes.`,
+			);
+		} catch (e) {
+			new Notice(`Come Gither: revert failed — ${e instanceof Error ? e.message : String(e)}`);
+		} finally {
+			await this.logger.flush();
+		}
+	}
+
+	async runSync(startup = false): Promise<void> {
 		if (this.syncing) {
 			new Notice("Come Gither: a sync is already running.");
 			return;

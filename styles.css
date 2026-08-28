@@ -8,3 +8,32 @@
 	text-align: center;
 	padding: var(--size-4-8);
 }
+
+.come-gither-preview {
+	padding: var(--size-4-4);
+}
+.come-gither-preview-actions {
+	display: flex;
+	gap: var(--size-4-2);
+	margin-bottom: var(--size-4-4);
+}
+.come-gither-preview-list {
+	display: flex;
+	flex-direction: column;
+	gap: var(--size-2-2);
+}
+.come-gither-preview-row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: var(--size-4-2);
+	padding: var(--size-2-2) 0;
+	border-bottom: 1px solid var(--background-modifier-border);
+}
+.come-gither-preview-path {
+	word-break: break-all;
+}
+.come-gither-preview-action {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+}
