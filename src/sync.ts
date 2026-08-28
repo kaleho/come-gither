@@ -1,4 +1,5 @@
 import { GitHubError } from "./github";
+import { isUtf8Text, threeWayMerge } from "./merge";
 import type { Files } from "./ports";
 import type { FileEntry, StateStore } from "./state";
 
@@ -21,6 +22,7 @@ export interface SyncConfig {
 	textExtensions: string[];
 	maxAutoFetchBytes: number;
 	maxPushBytes: number;
+	conflictPolicy: "merge" | "remote-wins";
 }
 
 export const DEFAULT_TEXT_EXTENSIONS = [
@@ -35,6 +37,7 @@ export interface PullSummary {
 	placeholders: number;
 	adopted: number;
 	deleted: number;
+	merged: number;
 	conflicts: number;
 }
 
@@ -156,6 +159,7 @@ export class SyncEngine {
 			placeholders: 0,
 			adopted: 0,
 			deleted: 0,
+			merged: 0,
 			conflicts: 0,
 		};
 		const head = await this.gh.getRef(this.config.branch);
@@ -200,13 +204,11 @@ export class SyncEngine {
 				summary.adopted += 1;
 				return;
 			}
-			if (!path.startsWith(".obsidian/")) {
-				// ponytail: M4 keeps the local side on any conflict; M6 adds diff3 + policy.
-				summary.conflicts += 1;
-				this.log("warn", `conflict on ${path}: keeping the local version`);
+			if (!path.startsWith(".obsidian/") && this.config.conflictPolicy === "merge") {
+				await this.resolveConflict(path, blob, entry, localSha, summary);
 				return;
 			}
-			// .obsidian/ is pinned remote-wins: fall through and overwrite.
+			// remote-wins policy, and .obsidian/ always: fall through and overwrite.
 		}
 		if (blob.size > this.config.maxAutoFetchBytes || (!this.isText(path) && !path.startsWith(".obsidian/"))) {
 			await this.files.writeBinary(path, new ArrayBuffer(0));
@@ -218,6 +220,35 @@ export class SyncEngine {
 		await this.files.writeBinary(path, data);
 		await this.record(path, blob.sha, false);
 		summary.fetched += 1;
+	}
+
+	/** Both sides changed under the merge policy: try diff3, else save the remote copy. */
+	private async resolveConflict(
+		path: string,
+		blob: RemoteBlob,
+		entry: FileEntry | undefined,
+		localSha: string,
+		summary: PullSummary,
+	): Promise<void> {
+		const remoteData = await this.gh.getBlobRaw(blob.sha);
+		if (entry && localSha !== "missing") {
+			const baseData = await this.gh.getBlobRaw(entry.baseBlobSha);
+			const localData = await this.files.readBinary(path);
+			if (isUtf8Text(baseData) && isUtf8Text(localData) && isUtf8Text(remoteData)) {
+				const decode = (d: ArrayBuffer) => new TextDecoder().decode(d);
+				const merged = threeWayMerge(decode(localData), decode(baseData), decode(remoteData));
+				if (merged !== null) {
+					// The merged text stays a local change; the next push commits it.
+					await this.files.writeBinary(path, new TextEncoder().encode(merged).buffer as ArrayBuffer);
+					summary.merged += 1;
+					this.log("info", `auto-merged ${path}`);
+					return;
+				}
+			}
+		}
+		await this.files.writeBinary(`_conflicts/${path}`, remoteData);
+		summary.conflicts += 1;
+		this.log("warn", `conflict on ${path}: kept the local version, saved the remote one to _conflicts/${path}`);
 	}
 
 	private async applyRemoteDelete(path: string, summary: PullSummary): Promise<void> {

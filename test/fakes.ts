@@ -119,11 +119,15 @@ export class FakeGitHub {
 	truncateRecursive = false;
 	private commitCounter = 0;
 
+	private allBlobs = new Map<string, Uint8Array>();
+
 	async setFiles(contents: Record<string, Uint8Array | string>): Promise<void> {
 		this.filesByPath.clear();
 		for (const [path, data] of Object.entries(contents)) {
 			const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
-			this.filesByPath.set(path, { sha: await gitSha(bytes), size: bytes.length, bytes });
+			const sha = await gitSha(bytes);
+			this.filesByPath.set(path, { sha, size: bytes.length, bytes });
+			this.allBlobs.set(sha, bytes); // git keeps every historical blob
 		}
 		this.head = `commit-${++this.commitCounter}`;
 	}
@@ -222,9 +226,8 @@ export class FakeGitHub {
 			throw new Error("network dropped");
 		}
 		this.blobFetches.push(sha);
-		for (const f of this.filesByPath.values()) {
-			if (f.sha === sha) return f.bytes.slice().buffer as ArrayBuffer;
-		}
+		const bytes = this.allBlobs.get(sha);
+		if (bytes) return bytes.slice().buffer as ArrayBuffer;
 		throw new Error(`no blob ${sha}`);
 	}
 }

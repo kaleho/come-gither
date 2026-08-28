@@ -5,7 +5,9 @@ import { FakeGitHub, MemFiles, gitSha } from "./fakes";
 
 const STATE_PATH = ".obsidian/plugins/come-gither/sync-state.json";
 
-function makeEngine(overrides: { maxAutoFetchBytes?: number; maxPushBytes?: number } = {}) {
+function makeEngine(
+	overrides: { maxAutoFetchBytes?: number; maxPushBytes?: number; conflictPolicy?: "merge" | "remote-wins" } = {},
+) {
 	const gh = new FakeGitHub();
 	const files = new MemFiles();
 	const state = new StateStore(files, STATE_PATH);
@@ -15,6 +17,7 @@ function makeEngine(overrides: { maxAutoFetchBytes?: number; maxPushBytes?: numb
 		textExtensions: DEFAULT_TEXT_EXTENSIONS,
 		maxAutoFetchBytes: overrides.maxAutoFetchBytes ?? 100 * 1048576,
 		maxPushBytes: overrides.maxPushBytes ?? 30 * 1048576,
+		conflictPolicy: overrides.conflictPolicy ?? "merge",
 	});
 	return { gh, files, state, engine, logs };
 }
@@ -134,6 +137,7 @@ describe("pull: incremental", () => {
 		const summary = await engine.pull();
 		expect(summary.conflicts).toBe(1);
 		expect(await files.stat("a.md")).toBeNull();
+		expect(files.readText("_conflicts/a.md")).toBe("remote edit");
 	});
 
 	it("treats an extensionless file as binary and makes a placeholder", async () => {
@@ -144,7 +148,7 @@ describe("pull: incremental", () => {
 		expect((await files.stat("LICENSE"))?.size).toBe(0);
 	});
 
-	it("keeps the local side when both sides changed (merge comes later)", async () => {
+	it("keeps the local side and saves the remote copy when text edits overlap", async () => {
 		const { gh, files, engine } = makeEngine();
 		await gh.setFiles({ "a.md": "base" });
 		await engine.pull();
@@ -153,6 +157,7 @@ describe("pull: incremental", () => {
 		const summary = await engine.pull();
 		expect(summary.conflicts).toBe(1);
 		expect(files.readText("a.md")).toBe("local edit");
+		expect(files.readText("_conflicts/a.md")).toBe("remote edit");
 	});
 
 	it("takes the remote side for a both-changed file under .obsidian/", async () => {
@@ -343,5 +348,73 @@ describe("sync: fast-forward retry", () => {
 		const err = await engine.sync().catch((e) => e);
 		expect(err.kind).toBe("not-fast-forward");
 		expect(gh.failUpdateRefTimes).toBe(96);
+	});
+});
+
+describe("pull: conflict resolution", () => {
+	it("auto-merges text edits on different lines and leaves the merge for push", async () => {
+		const { gh, files, state, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one\ntwo\nthree\nfour\nfive" });
+		await engine.pull();
+		const baseSha = state.state.files["a.md"].baseBlobSha;
+		await files.writeBinary("a.md", text("ONE\ntwo\nthree\nfour\nfive"));
+		await gh.setFiles({ "a.md": "one\ntwo\nthree\nfour\nFIVE" });
+		const summary = await engine.pull();
+		expect(summary.merged).toBe(1);
+		expect(summary.conflicts).toBe(0);
+		expect(files.readText("a.md")).toBe("ONE\ntwo\nthree\nfour\nFIVE");
+		expect(state.state.files["a.md"].baseBlobSha).toBe(baseSha);
+		const push = await engine.push();
+		expect(push.pushed).toBe(1);
+		expect(gh.createdBlobs.has(await gitSha("ONE\ntwo\nthree\nfour\nFIVE"))).toBe(true);
+	});
+
+	it("saves the remote copy for a both-changed binary file", async () => {
+		const { gh, files, engine } = makeEngine();
+		const base = new Uint8Array([0, 1, 2]);
+		const local = new Uint8Array([0, 9, 2]);
+		const remote = new Uint8Array([0, 1, 9]);
+		await gh.setFiles({ "img.png": base });
+		await engine.pull();
+		// The placeholder is lazy; simulate a fetched-then-edited binary instead.
+		await files.writeBinary("img.png", local.buffer as ArrayBuffer);
+		await gh.setFiles({ "img.png": remote });
+		const summary = await engine.pull();
+		expect(summary.conflicts).toBe(1);
+		expect(new Uint8Array(await files.readBinary("img.png"))).toEqual(local);
+		expect(new Uint8Array(await files.readBinary("_conflicts/img.png"))).toEqual(remote);
+	});
+
+	it("takes the remote version everywhere under the remote-wins policy", async () => {
+		const { gh, files, engine } = makeEngine({ conflictPolicy: "remote-wins" });
+		await gh.setFiles({ "a.md": "base" });
+		await engine.pull();
+		await files.writeBinary("a.md", text("local edit"));
+		await gh.setFiles({ "a.md": "remote edit" });
+		const summary = await engine.pull();
+		expect(summary.conflicts).toBe(0);
+		expect(files.readText("a.md")).toBe("remote edit");
+		expect(await files.stat("_conflicts/a.md")).toBeNull();
+	});
+
+	it("restores a locally deleted file under the remote-wins policy", async () => {
+		const { gh, files, engine } = makeEngine({ conflictPolicy: "remote-wins" });
+		await gh.setFiles({ "a.md": "base" });
+		await engine.pull();
+		await files.remove("a.md");
+		await gh.setFiles({ "a.md": "remote edit" });
+		const summary = await engine.pull();
+		expect(summary.conflicts).toBe(0);
+		expect(files.readText("a.md")).toBe("remote edit");
+	});
+
+	it("saves a conflict copy when an untracked local file differs from a new remote file", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "new.md": "remote version" });
+		await files.writeBinary("new.md", text("local version"));
+		const summary = await engine.pull();
+		expect(summary.conflicts).toBe(1);
+		expect(files.readText("new.md")).toBe("local version");
+		expect(files.readText("_conflicts/new.md")).toBe("remote version");
 	});
 });
