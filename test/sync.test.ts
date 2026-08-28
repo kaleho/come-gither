@@ -5,7 +5,7 @@ import { FakeGitHub, MemFiles, gitSha } from "./fakes";
 
 const STATE_PATH = ".obsidian/plugins/come-gither/sync-state.json";
 
-function makeEngine(overrides: { maxAutoFetchBytes?: number } = {}) {
+function makeEngine(overrides: { maxAutoFetchBytes?: number; maxPushBytes?: number } = {}) {
 	const gh = new FakeGitHub();
 	const files = new MemFiles();
 	const state = new StateStore(files, STATE_PATH);
@@ -14,9 +14,12 @@ function makeEngine(overrides: { maxAutoFetchBytes?: number } = {}) {
 		branch: "master",
 		textExtensions: DEFAULT_TEXT_EXTENSIONS,
 		maxAutoFetchBytes: overrides.maxAutoFetchBytes ?? 100 * 1048576,
+		maxPushBytes: overrides.maxPushBytes ?? 30 * 1048576,
 	});
 	return { gh, files, state, engine, logs };
 }
+
+const text = (s: string) => new TextEncoder().encode(s).buffer as ArrayBuffer;
 
 describe("pull: initial", () => {
 	it("fetches text files and writes lazy placeholders for binaries", async () => {
@@ -205,5 +208,140 @@ describe("pull: resumability and truncation", () => {
 		const summary = await engine.pull();
 		expect(summary.fetched).toBe(2);
 		expect(files.readText("deep/nested/b.md")).toBe("two");
+	});
+});
+
+describe("push", () => {
+	it("does nothing when there are no local changes", async () => {
+		const { gh, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one" });
+		await engine.pull();
+		const summary = await engine.push();
+		expect(summary).toEqual({ pushed: 0, deletedRemote: 0, skipped: 0, commit: null });
+		expect(gh.pushedTrees).toEqual([]);
+	});
+
+	it("pushes a new local file as blob, tree, commit, and ref update", async () => {
+		const { gh, files, state, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one" });
+		await engine.pull();
+		const base = gh.head;
+		await files.writeBinary("new.md", text("fresh"));
+		const summary = await engine.push();
+		expect(summary.pushed).toBe(1);
+		const sha = await gitSha("fresh");
+		expect(gh.createdBlobs.has(sha)).toBe(true);
+		expect(gh.pushedTrees[0].entries).toEqual([{ path: "new.md", mode: "100644", type: "blob", sha }]);
+		const commit = gh.pushedCommits.get(summary.commit as string);
+		expect(commit?.parents).toEqual([base]);
+		expect(gh.head).toBe(summary.commit);
+		expect(state.state.lastSyncedCommit).toBe(summary.commit);
+		expect(state.state.files["new.md"].baseBlobSha).toBe(sha);
+	});
+
+	it("pushes only the modified file, not untouched ones", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one", "b.md": "two" });
+		await engine.pull();
+		await files.writeBinary("b.md", text("TWO local"));
+		const summary = await engine.push();
+		expect(summary.pushed).toBe(1);
+		expect(gh.createdBlobs.size).toBe(1);
+		expect(gh.pushedTrees[0].entries.map((e) => e.path)).toEqual(["b.md"]);
+	});
+
+	it("does not push a file whose mtime changed but content did not", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one" });
+		await engine.pull();
+		await files.writeBinary("a.md", text("one"));
+		const summary = await engine.push();
+		expect(summary.commit).toBe(null);
+	});
+
+	it("propagates a local deletion as a null-sha tree entry", async () => {
+		const { gh, files, state, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one", "b.md": "two" });
+		await engine.pull();
+		await files.remove("b.md");
+		const summary = await engine.push();
+		expect(summary.deletedRemote).toBe(1);
+		expect(gh.pushedTrees[0].entries).toEqual([{ path: "b.md", mode: "100644", type: "blob", sha: null }]);
+		expect(state.state.files["b.md"]).toBeUndefined();
+	});
+
+	it("skips oversized files with a warning", async () => {
+		const { gh, files, engine, logs } = makeEngine({ maxPushBytes: 4 });
+		await gh.setFiles({ "a.md": "one" });
+		await engine.pull();
+		await files.writeBinary("huge.md", text("way past the cap"));
+		const summary = await engine.push();
+		expect(summary.skipped).toBe(1);
+		expect(summary.commit).toBe(null);
+		expect(logs.some((l) => l.includes("huge.md"))).toBe(true);
+	});
+
+	it("never pushes an untouched lazy placeholder", async () => {
+		const { gh, engine } = makeEngine();
+		await gh.setFiles({ "big.pdf": new Uint8Array([1, 2, 3]) });
+		await engine.pull();
+		const summary = await engine.push();
+		expect(summary.commit).toBe(null);
+	});
+
+	it("skips a modified placeholder with a warning instead of overwriting the remote file", async () => {
+		const { gh, files, engine, logs } = makeEngine();
+		await gh.setFiles({ "big.pdf": new Uint8Array([1, 2, 3]) });
+		await engine.pull();
+		await files.writeBinary("big.pdf", text("scribble"));
+		const summary = await engine.push();
+		expect(summary.commit).toBe(null);
+		expect(summary.skipped).toBe(1);
+		expect(logs.some((l) => l.includes("big.pdf"))).toBe(true);
+	});
+
+	it("does not delete the remote file when a placeholder is deleted locally", async () => {
+		const { gh, files, state, engine } = makeEngine();
+		await gh.setFiles({ "big.pdf": new Uint8Array([1, 2, 3]) });
+		await engine.pull();
+		await files.remove("big.pdf");
+		const summary = await engine.push();
+		expect(summary.commit).toBe(null);
+		expect(summary.deletedRemote).toBe(0);
+		expect(state.state.files["big.pdf"]).toBeUndefined();
+	});
+
+	it("never pushes _conflicts/ or its own plugin folder", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one" });
+		await engine.pull();
+		await files.writeBinary("_conflicts/x.md", text("copy"));
+		await files.writeBinary(".obsidian/plugins/come-gither/data.json", text("{token}"));
+		const summary = await engine.push();
+		expect(summary.commit).toBe(null);
+	});
+});
+
+describe("sync: fast-forward retry", () => {
+	it("re-pulls and retries when the ref moved under it", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one" });
+		await engine.pull();
+		await files.writeBinary("new.md", text("fresh"));
+		gh.failUpdateRefTimes = 1;
+		const { push } = await engine.sync();
+		expect(push.commit).not.toBe(null);
+		expect(gh.head).toBe(push.commit);
+	});
+
+	it("gives up after three attempts", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one" });
+		await engine.pull();
+		await files.writeBinary("new.md", text("fresh"));
+		gh.failUpdateRefTimes = 99;
+		const err = await engine.sync().catch((e) => e);
+		expect(err.kind).toBe("not-fast-forward");
+		expect(gh.failUpdateRefTimes).toBe(96);
 	});
 });
