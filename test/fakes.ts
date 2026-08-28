@@ -45,6 +45,52 @@ export class FakeHttp implements Http {
 	}
 }
 
+import type { Files } from "../src/ports";
+
+export class MemFiles implements Files {
+	store = new Map<string, Uint8Array>();
+	mtimes = new Map<string, number>();
+	writes: string[] = [];
+	private tick = 0;
+
+	async readBinary(path: string): Promise<ArrayBuffer> {
+		const data = this.store.get(path);
+		if (!data) throw new Error(`ENOENT: ${path}`);
+		return data.slice().buffer as ArrayBuffer;
+	}
+
+	async writeBinary(path: string, data: ArrayBuffer): Promise<void> {
+		this.store.set(path, new Uint8Array(data.slice(0)));
+		this.mtimes.set(path, ++this.tick);
+		this.writes.push(path);
+	}
+
+	async stat(path: string): Promise<{ mtime: number; size: number } | null> {
+		const data = this.store.get(path);
+		if (!data) return null;
+		return { mtime: this.mtimes.get(path) ?? 0, size: data.byteLength };
+	}
+
+	async listRecursive(prefix: string): Promise<string[]> {
+		return [...this.store.keys()].filter((p) => p.startsWith(prefix)).sort();
+	}
+
+	async remove(path: string): Promise<void> {
+		this.store.delete(path);
+		this.mtimes.delete(path);
+	}
+
+	writeText(path: string, text: string): void {
+		this.store.set(path, new TextEncoder().encode(text));
+	}
+
+	readText(path: string): string {
+		const data = this.store.get(path);
+		if (!data) throw new Error(`ENOENT: ${path}`);
+		return new TextDecoder().decode(data);
+	}
+}
+
 /** Virtual clock: sleep() advances time instantly and records the delay. */
 export class FakeClock {
 	t = 0;
