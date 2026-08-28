@@ -728,3 +728,42 @@ describe("revert", () => {
 		expect(await engine.revert("a.md")).toBe("clean");
 	});
 });
+
+describe("stale empty stubs", () => {
+	it("treats an untracked zero-byte file as absent, not a conflict", async () => {
+		const { gh, files, state, engine } = makeEngine();
+		// A stale stub with no state entry (state lost), remote has the real binary.
+		await files.writeBinary("assets/photo.png", new ArrayBuffer(0));
+		await gh.setFiles({ "assets/photo.png": new Uint8Array([1, 2, 3]), "a.md": "hi" });
+		const summary = await engine.pull();
+		expect(summary.conflicts).toBe(0);
+		expect(summary.placeholders).toBe(1);
+		expect(state.state.files["assets/photo.png"].lazy).toBe(true);
+		expect(await files.stat("_conflicts/assets/photo.png")).toBeNull();
+	});
+
+	it("fetches over an untracked zero-byte stub of a text file", async () => {
+		const { gh, files, engine } = makeEngine();
+		await files.writeBinary("note.md", new ArrayBuffer(0));
+		await gh.setFiles({ "note.md": "real content" });
+		const summary = await engine.pull();
+		expect(summary.conflicts).toBe(0);
+		expect(files.readText("note.md")).toBe("real content");
+	});
+
+	it("preview classifies an untracked zero-byte stub as placeholder, not both-changed", async () => {
+		const { gh, files, engine } = makeEngine();
+		await files.writeBinary("assets/photo.png", new ArrayBuffer(0));
+		await gh.setFiles({ "assets/photo.png": new Uint8Array([1, 2, 3]) });
+		const plan = await engine.preview();
+		expect(plan.incoming).toEqual([{ path: "assets/photo.png", action: "placeholder" }]);
+	});
+
+	it("still protects an untracked zero-byte file when the remote file is also empty-equal", async () => {
+		const { gh, files, engine } = makeEngine();
+		await files.writeBinary("empty.md", new ArrayBuffer(0));
+		await gh.setFiles({ "empty.md": "" });
+		const summary = await engine.pull();
+		expect(summary.adopted).toBe(1); // identical empty content adopts, no fetch
+	});
+});

@@ -66,6 +66,9 @@ export interface SyncPlan {
 
 export type LogFn = (level: "info" | "warn" | "error", message: string) => void;
 
+/** git blob sha of empty content. */
+const EMPTY_BLOB_SHA = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+
 interface RemoteBlob {
 	sha: string;
 	size: number;
@@ -135,7 +138,8 @@ export class SyncEngine {
 				if (entry && entry.baseBlobSha === blob.sha) continue;
 				const localSha = await this.localShaIfChanged(path, entry, false);
 				let action: IncomingAction;
-				if (localSha === "clean") action = this.isLazyTarget(path, blob.size) ? "placeholder" : "fetch";
+				const staleStub = !entry && localSha === EMPTY_BLOB_SHA;
+				if (localSha === "clean" || staleStub) action = this.isLazyTarget(path, blob.size) ? "placeholder" : "fetch";
 				else if (localSha === blob.sha) action = "adopt";
 				else if (path.startsWith(".obsidian/") || this.config.conflictPolicy === "remote-wins") action = "overwrite";
 				else action = "both-changed";
@@ -331,11 +335,13 @@ export class SyncEngine {
 				summary.adopted += 1;
 				return;
 			}
-			if (!path.startsWith(".obsidian/") && this.config.conflictPolicy === "merge") {
+			// A stale zero-byte stub with no tracking has no user data to protect.
+			const staleStub = !entry && localSha === EMPTY_BLOB_SHA;
+			if (!staleStub && !path.startsWith(".obsidian/") && this.config.conflictPolicy === "merge") {
 				await this.resolveConflict(path, blob, entry, localSha, summary);
 				return;
 			}
-			// remote-wins policy, and .obsidian/ always: fall through and overwrite.
+			// stale stub, remote-wins policy, and .obsidian/ always: fall through and overwrite.
 		}
 		if (this.isLazyTarget(path, blob.size)) {
 			await this.files.writeBinary(path, new ArrayBuffer(0));
