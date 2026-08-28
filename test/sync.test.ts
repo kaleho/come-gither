@@ -313,7 +313,7 @@ describe("push", () => {
 		const summary = await engine.push();
 		expect(summary.commit).toBe(null);
 		expect(summary.deletedRemote).toBe(0);
-		expect(state.state.files["big.pdf"]).toBeUndefined();
+		expect(state.state.files["big.pdf"].lazy).toBe(true); // stub restored, still tracked
 	});
 
 	it("never pushes _conflicts/ or its own plugin folder", async () => {
@@ -458,5 +458,111 @@ describe("fetchLazy", () => {
 		await files.writeBinary("big.pdf", text("scribble"));
 		expect(await engine.fetchLazy("big.pdf")).toBe("modified");
 		expect(files.readText("big.pdf")).toBe("scribble");
+	});
+});
+
+describe("state persistence across engine instances", () => {
+	function secondEngine(files: MemFiles, gh: FakeGitHub) {
+		const state = new StateStore(files, STATE_PATH);
+		const engine = new SyncEngine(gh, files, state, () => {}, {
+			branch: "master",
+			textExtensions: DEFAULT_TEXT_EXTENSIONS,
+			maxAutoFetchBytes: 100 * 1048576,
+			maxPushBytes: 30 * 1048576,
+			conflictPolicy: "merge",
+		});
+		return { state, engine };
+	}
+
+	it("persists a lazy fetch immediately, so a fresh engine sees the file as downloaded", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "big.pdf": new Uint8Array([1, 2, 3]) });
+		await engine.pull();
+		await engine.fetchLazy("big.pdf");
+		const { state } = secondEngine(files, gh);
+		await state.load();
+		expect(state.state.files["big.pdf"].lazy).toBeUndefined();
+	});
+
+	it("a downloaded binary deleted locally propagates as a remote deletion in a fresh engine", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "big.pdf": new Uint8Array([1, 2, 3]), "a.md": "keep" });
+		await engine.pull();
+		await engine.fetchLazy("big.pdf");
+		await files.remove("big.pdf");
+		const { state, engine: engine2 } = secondEngine(files, gh);
+		await state.load();
+		const summary = await engine2.push();
+		expect(summary.deletedRemote).toBe(1);
+		expect(gh.pushedTrees[0].entries).toEqual([{ path: "big.pdf", mode: "100644", type: "blob", sha: null }]);
+	});
+
+	it("restores a deleted placeholder on push and keeps its state entry, persisted", async () => {
+		const { gh, files, state, engine } = makeEngine();
+		await gh.setFiles({ "big.pdf": new Uint8Array([1, 2, 3]) });
+		await engine.pull();
+		await files.remove("big.pdf");
+		const summary = await engine.push();
+		expect(summary.deletedRemote).toBe(0);
+		expect(summary.commit).toBe(null);
+		expect((await files.stat("big.pdf"))?.size).toBe(0);
+		expect(state.state.files["big.pdf"].lazy).toBe(true);
+		const { state: fresh } = secondEngine(files, gh);
+		await fresh.load();
+		expect(fresh.state.files["big.pdf"].lazy).toBe(true);
+	});
+});
+
+describe("evict", () => {
+	it("turns a downloaded file back into a placeholder, persisted", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "big.pdf": new Uint8Array([1, 2, 3]) });
+		await engine.pull();
+		await engine.fetchLazy("big.pdf");
+		expect(await engine.evict("big.pdf")).toBe("evicted");
+		expect((await files.stat("big.pdf"))?.size).toBe(0);
+		const fresh = new StateStore(files, STATE_PATH);
+		await fresh.load();
+		expect(fresh.state.files["big.pdf"].lazy).toBe(true);
+		// Evicted file is not treated as a local change by push.
+		expect((await engine.push()).commit).toBe(null);
+	});
+
+	it("refuses to evict a file with unpushed local edits", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "base" });
+		await engine.pull();
+		await files.writeBinary("a.md", text("edited"));
+		expect(await engine.evict("a.md")).toBe("modified");
+		expect(files.readText("a.md")).toBe("edited");
+	});
+
+	it("refuses to evict an untracked file or an existing placeholder", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "big.pdf": new Uint8Array([1, 2, 3]) });
+		await engine.pull();
+		expect(await engine.evict("big.pdf")).toBe("not-evictable");
+		await files.writeBinary("untracked.md", text("x"));
+		expect(await engine.evict("untracked.md")).toBe("not-evictable");
+	});
+});
+
+describe("remote size on lazy entries", () => {
+	it("records the remote size on a placeholder from pull", async () => {
+		const { gh, state, engine } = makeEngine();
+		await gh.setFiles({ "big.pdf": new Uint8Array(2048) });
+		await engine.pull();
+		expect(state.state.files["big.pdf"].remoteSize).toBe(2048);
+	});
+
+	it("keeps the size through evict and drops it on fetch", async () => {
+		const { gh, state, engine } = makeEngine();
+		await gh.setFiles({ "big.pdf": new Uint8Array(2048) });
+		await engine.pull();
+		await engine.fetchLazy("big.pdf");
+		expect(state.state.files["big.pdf"].remoteSize).toBeUndefined();
+		await engine.evict("big.pdf");
+		expect(state.state.files["big.pdf"].remoteSize).toBe(2048);
+		expect(state.state.files["big.pdf"].lazy).toBe(true);
 	});
 });

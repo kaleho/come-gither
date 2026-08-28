@@ -84,8 +84,25 @@ export class SyncEngine {
 		const data = await this.gh.getBlobRaw(entry.baseBlobSha);
 		await this.files.writeBinary(path, data);
 		await this.record(path, entry.baseBlobSha, false);
+		await this.state.flush(); // a single-entry change never reaches the cadence threshold
 		this.log("info", `fetched ${path} (${data.byteLength} bytes)`);
 		return "fetched";
+	}
+
+	/** Free device space: replace a clean downloaded file with a placeholder again. */
+	async evict(path: string): Promise<"evicted" | "not-evictable" | "modified"> {
+		const entry = this.state.state.files[path];
+		if (!entry || entry.lazy) return "not-evictable";
+		if ((await this.localShaIfChanged(path, entry)) !== "clean") {
+			this.log("warn", `${path} has local changes; push them before removing the local copy`);
+			return "modified";
+		}
+		const remoteSize = entry.size;
+		await this.files.writeBinary(path, new ArrayBuffer(0));
+		await this.record(path, entry.baseBlobSha, true, remoteSize);
+		await this.state.flush();
+		this.log("info", `evicted ${path}; the placeholder stays until you download it again`);
+		return "evicted";
 	}
 
 	async push(): Promise<PushSummary> {
@@ -116,11 +133,17 @@ export class SyncEngine {
 		}
 
 		const droppedPaths: string[] = [];
+		let restoredPlaceholders = 0;
 		for (const path of Object.keys(this.state.state.files)) {
 			if (localPaths.has(path)) continue;
-			if (this.state.state.files[path].lazy) {
-				// A deleted placeholder must never delete the real remote file.
-				droppedPaths.push(path);
+			const entry = this.state.state.files[path];
+			if (entry.lazy) {
+				// A deleted placeholder must never delete the real remote file;
+				// its content was never on this device to judge. Restore the stub.
+				await this.files.writeBinary(path, new ArrayBuffer(0));
+				await this.record(path, entry.baseBlobSha, true, entry.remoteSize);
+				restoredPlaceholders += 1;
+				this.log("info", `restored the placeholder for ${path}`);
 				continue;
 			}
 			treeEntries.push({ path, mode: "100644", type: "blob", sha: null });
@@ -129,7 +152,7 @@ export class SyncEngine {
 		}
 
 		if (treeEntries.length === 0) {
-			for (const path of droppedPaths) await this.state.removeFile(path);
+			if (restoredPlaceholders > 0) await this.state.flush();
 			return summary;
 		}
 
@@ -226,7 +249,7 @@ export class SyncEngine {
 		}
 		if (blob.size > this.config.maxAutoFetchBytes || (!this.isText(path) && !path.startsWith(".obsidian/"))) {
 			await this.files.writeBinary(path, new ArrayBuffer(0));
-			await this.record(path, blob.sha, true);
+			await this.record(path, blob.sha, true, blob.size);
 			summary.placeholders += 1;
 			return;
 		}
@@ -295,13 +318,13 @@ export class SyncEngine {
 		if (stat.mtime === entry.mtime && stat.size === entry.size) return "clean";
 		const sha = await gitBlobSha1(await this.files.readBinary(path));
 		if (sha === entry.baseBlobSha) {
-			await this.record(path, entry.baseBlobSha, entry.lazy === true); // refresh fingerprint
+			await this.record(path, entry.baseBlobSha, entry.lazy === true, entry.remoteSize); // refresh fingerprint
 			return "clean";
 		}
 		return sha;
 	}
 
-	private async record(path: string, sha: string, lazy: boolean): Promise<void> {
+	private async record(path: string, sha: string, lazy: boolean, remoteSize?: number): Promise<void> {
 		// Only ever called right after a write or on an existing file.
 		const stat = (await this.files.stat(path)) as { mtime: number; size: number };
 		const entry: FileEntry = {
@@ -309,7 +332,10 @@ export class SyncEngine {
 			size: stat.size,
 			mtime: stat.mtime,
 		};
-		if (lazy) entry.lazy = true;
+		if (lazy) {
+			entry.lazy = true;
+			entry.remoteSize = remoteSize;
+		}
 		await this.state.setFile(path, entry);
 	}
 

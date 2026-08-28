@@ -194,6 +194,16 @@ export default class ComeGitherPlugin extends Plugin {
 			name: "Export sync log",
 			callback: () => void this.exportLog(),
 		});
+		this.addCommand({
+			id: "evict-file",
+			name: "Remove local copy (keep on GitHub)",
+			checkCallback: (checking) => {
+				const file = this.app.workspace.getActiveFile();
+				if (!file) return false;
+				if (!checking) void this.evictFile(file);
+				return true;
+			},
+		});
 
 		this.registerEvent(
 			this.app.workspace.on("file-open", (file) => {
@@ -295,7 +305,7 @@ export default class ComeGitherPlugin extends Plugin {
 		await state.load();
 		this.lazySizes.clear();
 		for (const [path, entry] of Object.entries(state.state.files)) {
-			if (entry.lazy) this.lazySizes.set(path, entry.size);
+			if (entry.lazy) this.lazySizes.set(path, entry.remoteSize ?? 0);
 		}
 	}
 
@@ -331,6 +341,31 @@ export default class ComeGitherPlugin extends Plugin {
 		} catch (e) {
 			new Notice(`Come Gither: download failed — ${e instanceof Error ? e.message : String(e)}`);
 			throw e;
+		} finally {
+			await this.logger.flush();
+		}
+	}
+
+	private async evictFile(file: TFile): Promise<void> {
+		try {
+			const engine = await this.makeEngine();
+			const result = await engine.evict(file.path);
+			if (result === "evicted") {
+				await this.refreshLazyIndex();
+				const leaf = this.app.workspace.getMostRecentLeaf();
+				if (leaf && this.app.workspace.getActiveFile()?.path === file.path) {
+					await leaf.setViewState({
+						type: PLACEHOLDER_VIEW,
+						active: true,
+						state: { path: file.path, sizeBytes: this.lazySizes.get(file.path) ?? 0 },
+					});
+				}
+				new Notice(`Come Gither: removed the local copy of ${file.name}. It stays on GitHub.`);
+			} else if (result === "modified") {
+				new Notice(`Come Gither: ${file.name} has unpushed changes. Sync first.`);
+			} else {
+				new Notice(`Come Gither: ${file.name} is not a downloaded synced file.`);
+			}
 		} finally {
 			await this.logger.flush();
 		}

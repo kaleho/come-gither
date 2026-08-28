@@ -2,9 +2,10 @@ import type { Files } from "./ports";
 
 export interface FileEntry {
 	baseBlobSha: string;
-	size: number;
+	size: number; // local fingerprint (a placeholder's is 0)
 	mtime: number;
 	lazy?: true;
+	remoteSize?: number; // set on lazy entries: the real file's size on GitHub
 }
 
 export interface SyncState {
