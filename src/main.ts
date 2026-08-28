@@ -73,6 +73,9 @@ class ObsidianHttp implements Http {
 	}
 }
 
+// Deliberately uses Vault.adapter rather than the Vault API: sync must reach
+// dot-paths (.obsidian/), needs raw ArrayBuffer I/O, and bulk writes during a
+// pull should not churn the metadata cache file-by-file.
 class AdapterFiles implements Files {
 	constructor(private app: App) {}
 
