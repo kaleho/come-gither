@@ -1,11 +1,13 @@
 import {
 	App,
-	Modal,
+	ItemView,
 	Notice,
 	Plugin,
 	PluginSettingTab,
 	Setting,
 	TFile,
+	ViewStateResult,
+	WorkspaceLeaf,
 	normalizePath,
 	requestUrl,
 } from "obsidian";
@@ -105,32 +107,61 @@ class AdapterFiles implements Files {
 	}
 }
 
-class ConfirmFetchModal extends Modal {
+const PLACEHOLDER_VIEW = "come-gither-placeholder";
+
+class PlaceholderView extends ItemView {
+	private path = "";
+	private sizeBytes = 0;
+
 	constructor(
-		app: App,
-		private path: string,
-		private sizeBytes: number,
-		private onConfirm: () => void,
+		leaf: WorkspaceLeaf,
+		private plugin: ComeGitherPlugin,
 	) {
-		super(app);
+		super(leaf);
 	}
 
-	onOpen(): void {
-		this.contentEl.createEl("p", {
-			text: `${this.path} is a placeholder. Download the full file (${(this.sizeBytes / 1048576).toFixed(1)} MB)?`,
+	getViewType(): string {
+		return PLACEHOLDER_VIEW;
+	}
+
+	getDisplayText(): string {
+		return this.path.split("/").pop() ?? "Not downloaded";
+	}
+
+	getIcon(): string {
+		return "cloud-download";
+	}
+
+	async setState(state: { path?: string; sizeBytes?: number }, result: ViewStateResult): Promise<void> {
+		this.path = state.path ?? "";
+		this.sizeBytes = state.sizeBytes ?? 0;
+		this.render();
+		return super.setState(state, result);
+	}
+
+	getState(): { path: string; sizeBytes: number } {
+		return { path: this.path, sizeBytes: this.sizeBytes };
+	}
+
+	private render(): void {
+		const el = this.contentEl;
+		el.empty();
+		const wrap = el.createDiv({ cls: "come-gither-placeholder" });
+		wrap.createEl("h3", { text: this.getDisplayText() });
+		const mb = this.sizeBytes / 1048576;
+		wrap.createEl("p", {
+			text: `This file (${mb >= 1 ? mb.toFixed(1) + " MB" : Math.max(1, Math.round(this.sizeBytes / 1024)) + " KB"}) is not on this device yet.`,
 		});
-		new Setting(this.contentEl)
-			.addButton((b) =>
-				b.setButtonText("Download").setCta().onClick(() => {
-					this.close();
-					this.onConfirm();
-				}),
-			)
-			.addButton((b) => b.setButtonText("Not now").onClick(() => this.close()));
-	}
-
-	onClose(): void {
-		this.contentEl.empty();
+		const button = wrap.createEl("button", { text: "Download and open" });
+		button.addClass("mod-cta");
+		button.addEventListener("click", () => {
+			button.disabled = true;
+			button.setText("Downloading…");
+			void this.plugin.downloadAndOpen(this.path, this.leaf).catch(() => {
+				button.disabled = false;
+				button.setText("Download and open");
+			});
+		});
 	}
 }
 
@@ -150,6 +181,7 @@ export default class ComeGitherPlugin extends Plugin {
 		this.statusEl = this.addStatusBarItem();
 		this.setStatus("idle");
 
+		this.registerView(PLACEHOLDER_VIEW, (leaf) => new PlaceholderView(leaf, this));
 		this.addSettingTab(new ComeGitherSettingTab(this.app, this));
 
 		this.addCommand({
@@ -269,32 +301,38 @@ export default class ComeGitherPlugin extends Plugin {
 
 	private async maybeFetchLazy(file: TFile): Promise<void> {
 		if (!this.lazySizes.has(file.path) || this.syncing) return;
-		const size = this.lazySizes.get(file.path) as number;
-		const doFetch = async (): Promise<void> => {
-			try {
-				const engine = await this.makeEngine();
-				const result = await engine.fetchLazy(file.path);
-				if (result === "fetched") {
-					this.lazySizes.delete(file.path);
-					const leaf = this.app.workspace.getMostRecentLeaf();
-					if (leaf && this.app.workspace.getActiveFile()?.path === file.path) {
-						await leaf.openFile(file);
-					} else {
-						new Notice(`Come Gither: downloaded ${file.path}.`);
-					}
-				} else if (result === "modified") {
-					new Notice(`Come Gither: ${file.path} was changed locally; not overwriting it.`);
-				}
-			} catch (e) {
-				new Notice(`Come Gither: download failed — ${e instanceof Error ? e.message : String(e)}`);
-			} finally {
-				await this.logger.flush();
-			}
-		};
+		const leaf = this.app.workspace.getMostRecentLeaf();
 		if (this.settings.lazyFetchMode === "auto") {
-			await doFetch();
-		} else {
-			new ConfirmFetchModal(this.app, file.path, size, () => void doFetch()).open();
+			await this.downloadAndOpen(file.path, leaf ?? undefined);
+			return;
+		}
+		// Replace the broken binary viewer with the placeholder view in the same tab.
+		if (leaf) {
+			await leaf.setViewState({
+				type: PLACEHOLDER_VIEW,
+				active: true,
+				state: { path: file.path, sizeBytes: this.lazySizes.get(file.path) },
+			});
+		}
+	}
+
+	async downloadAndOpen(path: string, leaf?: WorkspaceLeaf): Promise<void> {
+		try {
+			const engine = await this.makeEngine();
+			const result = await engine.fetchLazy(path);
+			if (result === "fetched") {
+				this.lazySizes.delete(path);
+				const file = this.app.vault.getFileByPath(path);
+				if (file && leaf) await leaf.openFile(file);
+				else new Notice(`Come Gither: downloaded ${path}.`);
+			} else if (result === "modified") {
+				new Notice(`Come Gither: ${path} was changed locally; not overwriting it.`);
+			}
+		} catch (e) {
+			new Notice(`Come Gither: download failed — ${e instanceof Error ? e.message : String(e)}`);
+			throw e;
+		} finally {
+			await this.logger.flush();
 		}
 	}
 
@@ -353,10 +391,10 @@ class ComeGitherSettingTab extends PluginSettingTab {
 			);
 		new Setting(containerEl)
 			.setName("Placeholder downloads")
-			.setDesc("What happens when you open an unfetched binary file.")
+			.setDesc("Opening an unfetched file shows a download page, or downloads at once.")
 			.addDropdown((d) =>
 				d
-					.addOptions({ prompt: "Ask first", auto: "Download immediately" })
+					.addOptions({ prompt: "Show a download page", auto: "Download immediately" })
 					.setValue(s.lazyFetchMode)
 					.onChange((v) => ((s.lazyFetchMode = v as "prompt" | "auto"), save())),
 			);
