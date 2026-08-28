@@ -418,3 +418,45 @@ describe("pull: conflict resolution", () => {
 		expect(files.readText("_conflicts/new.md")).toBe("remote version");
 	});
 });
+
+describe("fetchLazy", () => {
+	it("downloads the real content for a placeholder and clears the lazy flag", async () => {
+		const { gh, files, state, engine } = makeEngine();
+		const bytes = new Uint8Array([1, 2, 3, 4]);
+		await gh.setFiles({ "big.pdf": bytes });
+		await engine.pull();
+		const result = await engine.fetchLazy("big.pdf");
+		expect(result).toBe("fetched");
+		expect(new Uint8Array(await files.readBinary("big.pdf"))).toEqual(bytes);
+		expect(state.state.files["big.pdf"].lazy).toBeUndefined();
+		// Now clean: neither push nor pull touches it again.
+		expect((await engine.push()).commit).toBe(null);
+		await gh.setFiles({ "big.pdf": bytes, "other.md": "x" });
+		gh.blobFetches.length = 0;
+		await engine.pull();
+		expect(gh.blobFetches).toEqual([await gitSha("x")]);
+	});
+
+	it("returns not-lazy for a normally tracked file", async () => {
+		const { gh, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one" });
+		await engine.pull();
+		gh.blobFetches.length = 0;
+		expect(await engine.fetchLazy("a.md")).toBe("not-lazy");
+		expect(gh.blobFetches).toEqual([]);
+	});
+
+	it("returns not-lazy for an unknown path", async () => {
+		const { engine } = makeEngine();
+		expect(await engine.fetchLazy("nope.pdf")).toBe("not-lazy");
+	});
+
+	it("refuses to overwrite a placeholder the user modified", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "big.pdf": new Uint8Array([1, 2, 3]) });
+		await engine.pull();
+		await files.writeBinary("big.pdf", text("scribble"));
+		expect(await engine.fetchLazy("big.pdf")).toBe("modified");
+		expect(files.readText("big.pdf")).toBe("scribble");
+	});
+});
