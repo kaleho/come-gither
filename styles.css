@@ -1,13 +1,3 @@
-.come-gither-placeholder {
-	display: flex;
-	flex-direction: column;
-	align-items: center;
-	justify-content: center;
-	height: 100%;
-	gap: var(--size-4-3);
-	text-align: center;
-	padding: var(--size-4-8);
-}
 
 .come-gither-preview {
 	padding: var(--size-4-4);

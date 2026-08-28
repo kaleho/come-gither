@@ -1,12 +1,12 @@
 import {
 	App,
 	ItemView,
+	Modal,
 	Notice,
 	Plugin,
 	PluginSettingTab,
 	Setting,
 	TFile,
-	ViewStateResult,
 	WorkspaceLeaf,
 	normalizePath,
 	requestUrl,
@@ -116,61 +116,34 @@ class AdapterFiles implements Files {
 	}
 }
 
-const PLACEHOLDER_VIEW = "come-gither-placeholder";
-
-class PlaceholderView extends ItemView {
-	private path = "";
-	private sizeBytes = 0;
-
+class ConfirmFetchModal extends Modal {
 	constructor(
-		leaf: WorkspaceLeaf,
-		private plugin: ComeGitherPlugin,
+		app: App,
+		private path: string,
+		private sizeBytes: number,
+		private onConfirm: () => void,
 	) {
-		super(leaf);
+		super(app);
 	}
 
-	getViewType(): string {
-		return PLACEHOLDER_VIEW;
-	}
-
-	getDisplayText(): string {
-		return this.path.split("/").pop() ?? "Not downloaded";
-	}
-
-	getIcon(): string {
-		return "cloud-download";
-	}
-
-	async setState(state: { path?: string; sizeBytes?: number }, result: ViewStateResult): Promise<void> {
-		this.path = state.path ?? "";
-		this.sizeBytes = state.sizeBytes ?? 0;
-		this.render();
-		return super.setState(state, result);
-	}
-
-	getState(): { path: string; sizeBytes: number } {
-		return { path: this.path, sizeBytes: this.sizeBytes };
-	}
-
-	private render(): void {
-		const el = this.contentEl;
-		el.empty();
-		const wrap = el.createDiv({ cls: "come-gither-placeholder" });
-		wrap.createEl("h3", { text: this.getDisplayText() });
+	onOpen(): void {
 		const mb = this.sizeBytes / 1048576;
-		wrap.createEl("p", {
-			text: `This file (${mb >= 1 ? mb.toFixed(1) + " MB" : Math.max(1, Math.round(this.sizeBytes / 1024)) + " KB"}) is not on this device yet.`,
+		const size = mb >= 1 ? `${mb.toFixed(1)} MB` : `${Math.max(1, Math.round(this.sizeBytes / 1024))} KB`;
+		this.contentEl.createEl("p", {
+			text: `${this.path} is not on this device yet. Download the full file (${size})?`,
 		});
-		const button = wrap.createEl("button", { text: "Download and open" });
-		button.addClass("mod-cta");
-		button.addEventListener("click", () => {
-			button.disabled = true;
-			button.setText("Downloading…");
-			void this.plugin.downloadAndOpen(this.path, this.leaf).catch(() => {
-				button.disabled = false;
-				button.setText("Download and open");
-			});
-		});
+		new Setting(this.contentEl)
+			.addButton((b) =>
+				b.setButtonText("Download").setCta().onClick(() => {
+					this.close();
+					this.onConfirm();
+				}),
+			)
+			.addButton((b) => b.setButtonText("Not now").onClick(() => this.close()));
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
 	}
 }
 
@@ -294,7 +267,6 @@ export default class ComeGitherPlugin extends Plugin {
 		this.statusEl = this.addStatusBarItem();
 		this.setStatus("idle");
 
-		this.registerView(PLACEHOLDER_VIEW, (leaf) => new PlaceholderView(leaf, this));
 		this.registerView(PREVIEW_VIEW, (leaf) => new PreviewView(leaf, this));
 		this.addSettingTab(new ComeGitherSettingTab(this.app, this));
 
@@ -460,20 +432,30 @@ export default class ComeGitherPlugin extends Plugin {
 	}
 
 	private async maybeFetchLazy(file: TFile): Promise<void> {
-		if (!this.lazySizes.has(file.path) || this.syncing) return;
+		if (!this.lazySizes.has(file.path)) {
+			// Diagnostic: a zero-byte file that is not tracked as lazy is a stale stub.
+			const stat = await this.vaultFiles.stat(file.path);
+			if (stat?.size === 0) {
+				this.logger.log(
+					"warn",
+					`opened zero-byte ${file.path} but it is not tracked as lazy (${this.lazySizes.size} lazy entries known)`,
+				);
+			}
+			return;
+		}
+		if (this.syncing) {
+			this.logger.log("info", `opened placeholder ${file.path} during a sync; ignoring`);
+			return;
+		}
+		this.logger.log("info", `opened placeholder ${file.path} (mode: ${this.settings.lazyFetchMode})`);
 		const leaf = this.app.workspace.getMostRecentLeaf();
 		if (this.settings.lazyFetchMode === "auto") {
 			await this.downloadAndOpen(file.path, leaf ?? undefined);
 			return;
 		}
-		// Replace the broken binary viewer with the placeholder view in the same tab.
-		if (leaf) {
-			await leaf.setViewState({
-				type: PLACEHOLDER_VIEW,
-				active: true,
-				state: { path: file.path, sizeBytes: this.lazySizes.get(file.path) },
-			});
-		}
+		new ConfirmFetchModal(this.app, file.path, this.lazySizes.get(file.path) as number, () =>
+			void this.downloadAndOpen(file.path, leaf ?? undefined),
+		).open();
 	}
 
 	async downloadAndOpen(path: string, leaf?: WorkspaceLeaf): Promise<void> {
@@ -502,14 +484,6 @@ export default class ComeGitherPlugin extends Plugin {
 			const result = await engine.evict(file.path);
 			if (result === "evicted") {
 				await this.refreshLazyIndex();
-				const leaf = this.app.workspace.getMostRecentLeaf();
-				if (leaf && this.app.workspace.getActiveFile()?.path === file.path) {
-					await leaf.setViewState({
-						type: PLACEHOLDER_VIEW,
-						active: true,
-						state: { path: file.path, sizeBytes: this.lazySizes.get(file.path) ?? 0 },
-					});
-				}
 				new Notice(`Come Gither: removed the local copy of ${file.name}. It stays on GitHub.`);
 			} else if (result === "modified") {
 				new Notice(`Come Gither: ${file.name} has unpushed changes. Sync first.`);
