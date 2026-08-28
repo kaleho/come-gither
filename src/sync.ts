@@ -74,6 +74,20 @@ export class SyncEngine {
 		private config: SyncConfig,
 	) {}
 
+	async fetchLazy(path: string): Promise<"fetched" | "not-lazy" | "modified"> {
+		const entry = this.state.state.files[path];
+		if (!entry?.lazy) return "not-lazy";
+		if ((await this.localShaIfChanged(path, entry)) !== "clean") {
+			this.log("warn", `${path} was modified locally; not overwriting it with the remote content`);
+			return "modified";
+		}
+		const data = await this.gh.getBlobRaw(entry.baseBlobSha);
+		await this.files.writeBinary(path, data);
+		await this.record(path, entry.baseBlobSha, false);
+		this.log("info", `fetched ${path} (${data.byteLength} bytes)`);
+		return "fetched";
+	}
+
 	async push(): Promise<PushSummary> {
 		const summary: PushSummary = { pushed: 0, deletedRemote: 0, skipped: 0, commit: null };
 		const treeEntries: { path: string; mode: string; type: "blob"; sha: string | null }[] = [];
