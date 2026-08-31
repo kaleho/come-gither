@@ -236,7 +236,19 @@ export class SyncEngine {
 				if (remote.has(path) || this.excluded(path)) continue;
 				if (remoteLower.has(path.toLowerCase())) {
 					const folded = [...localPaths].filter((p) => p.toLowerCase() === path.toLowerCase());
-					if (folded.length <= 1) {
+					const twinName = [...remote.keys()].find(
+						(p) => p !== path && p.toLowerCase() === path.toLowerCase(),
+					);
+					// Probe with the twin's exact name: on a case-insensitive
+					// filesystem it already resolves to this same file; on a
+					// case-sensitive one it does not exist until the pull fetches
+					// it, and the delete of the old casing is real.
+					const sameFile =
+						folded.length <= 1 &&
+						twinName !== undefined &&
+						!folded.includes(twinName) &&
+						(await this.files.stat(twinName)) !== null;
+					if (sameFile) {
 						// Case-only rename on one physical file: sync only drops
 						// the stale entry.
 						agreedDeleted.add(path);
@@ -285,8 +297,11 @@ export class SyncEngine {
 		for (const path of Object.keys(this.state.state.files)) {
 			const entry = this.state.state.files[path];
 			if (localPaths.has(path) || agreedDeleted.has(path) || this.excluded(path)) continue;
-			if (!entry.lazy && localLower.has(path.toLowerCase()) && !uploads.has(path.toLowerCase())) {
-				continue; // a case twin exists on disk and push will not delete it
+			if (!entry.lazy && !uploads.has(path.toLowerCase())) {
+				const twinOnDisk = [...localPaths].find((p) => p.toLowerCase() === path.toLowerCase());
+				// An untracked twin is a case rename of this very file; a twin
+				// with its own entry is a distinct file and the delete is real.
+				if (twinOnDisk !== undefined && this.state.state.files[twinOnDisk] === undefined) continue;
 			}
 			plan.outgoing.push({ path, action: entry.lazy ? "restore-placeholder" : "deleted" });
 		}
@@ -415,13 +430,19 @@ export class SyncEngine {
 				continue;
 			}
 			if (localLower.has(path.toLowerCase())) {
-				// A case twin of this entry exists on disk. Emit the delete only
-				// when the twin's content actually landed in this commit; a
-				// skipped upload plus a delete would remove the file from GitHub.
-				const uploaded = treeEntries.some(
-					(e) => e.sha !== null && e.path.toLowerCase() === path.toLowerCase(),
-				);
-				if (!uploaded) continue;
+				const twinOnDisk = [...localPaths].find((p) => p.toLowerCase() === path.toLowerCase());
+				const twinTracked = twinOnDisk !== undefined && this.state.state.files[twinOnDisk] !== undefined;
+				// An UNTRACKED twin on disk is a case rename of this very file:
+				// emit the delete only when the twin's content actually landed in
+				// this commit; a skipped upload plus a delete would remove the
+				// file from GitHub. A tracked twin is a distinct file, and the
+				// delete of this entry is genuine.
+				if (!twinTracked) {
+					const uploaded = treeEntries.some(
+						(e) => e.sha !== null && e.path.toLowerCase() === path.toLowerCase(),
+					);
+					if (!uploaded) continue;
+				}
 			}
 			treeEntries.push({ path, mode: "100644", type: "blob", sha: null });
 			droppedPaths.push(path);
