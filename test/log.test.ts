@@ -50,7 +50,7 @@ describe("RingLogger", () => {
 		expect(logger.dump().split("\n")).toEqual([
 			"old line 1",
 			"old line 2",
-			"--- session start ---",
+			"--- session start 1970-01-01T00:00:00.000Z ---",
 			"1970-01-01T00:00:00.000Z info early",
 			"1970-01-01T00:00:00.000Z info later",
 		]);
@@ -65,7 +65,17 @@ describe("RingLogger", () => {
 		const logger = new RingLogger(files, PATH, { capacity: 4, now: () => 0 });
 		await logger.init();
 		const lines = logger.dump().split("\n");
-		expect(lines).toEqual(["o7", "o8", "o9", "--- session start ---"]);
+		expect(lines).toEqual(["o7", "o8", "o9", "--- session start 1970-01-01T00:00:00.000Z ---"]);
+	});
+
+	it("init is idempotent", async () => {
+		const files = new MemFiles();
+		files.writeText(PATH, "old");
+		const logger = new RingLogger(files, PATH, { now: () => 0 });
+		await logger.init();
+		const before = logger.dump();
+		await logger.init();
+		expect(logger.dump()).toBe(before);
 	});
 
 	it("init tolerates a missing previous log", async () => {

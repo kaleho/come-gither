@@ -109,6 +109,17 @@ describe("GitHubClient writes", () => {
 		expect(body).toEqual({ sha: "c2", force: false });
 	});
 
+	it("caps the write throttle when the clock steps backwards", async () => {
+		const http = new FakeHttp();
+		http.on("POST", "/git/blobs", jsonResponse({ sha: "b" }, 201));
+		const clock = new FakeClock();
+		const client = makeClient(http, clock);
+		await client.createBlob(new ArrayBuffer(1));
+		clock.t -= 60_000; // an NTP step back must not stall the push silently
+		await client.createBlob(new ArrayBuffer(1));
+		expect(Math.max(...clock.sleeps)).toBeLessThanOrEqual(1000);
+	});
+
 	it("throttles consecutive createBlob calls to one per second", async () => {
 		const http = new FakeHttp();
 		http.on("POST", "/git/blobs", jsonResponse({ sha: "b" }, 201));

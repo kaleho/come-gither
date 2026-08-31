@@ -47,7 +47,9 @@ describe("clampSyncMinutes", () => {
 
 	it("clamps into the 3..60 contract and rounds", () => {
 		expect(clampSyncMinutes(1)).toBe(3);
+		expect(clampSyncMinutes(3)).toBe(3);
 		expect(clampSyncMinutes(4.4)).toBe(4);
+		expect(clampSyncMinutes(60)).toBe(60);
 		expect(clampSyncMinutes(999)).toBe(60);
 	});
 });

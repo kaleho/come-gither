@@ -64,7 +64,9 @@ describe("StateStore remote identity", () => {
 		expect(other.state.lastSyncedCommit).toBe(null);
 	});
 
-	it("adopts a legacy state file that has no remote stamp and stamps it", async () => {
+	it("re-baselines a legacy state file that has no remote stamp", async () => {
+		// An unstamped file may describe another repo (the settings could have
+		// changed before the upgrade); adopting it risks a mass local delete.
 		const files = new MemFiles();
 		files.writeText(
 			PATH,
@@ -72,9 +74,20 @@ describe("StateStore remote identity", () => {
 		);
 		const store = new StateStore(files, PATH);
 		await store.load("kaleho/vault#master");
-		expect(store.state.files["a.md"]).toEqual(entry("s1"));
+		expect(store.state.files).toEqual({});
+		expect(store.state.lastSyncedCommit).toBe(null);
+		expect(store.rebaselined).toBe(true);
 		await store.setCommit("c2");
 		expect(JSON.parse(files.readText(PATH)).remote).toBe("kaleho/vault#master");
+	});
+
+	it("treats a version-1 file with a broken shape as unusable", async () => {
+		const files = new MemFiles();
+		files.writeText(PATH, JSON.stringify({ version: 1, remote: "a/b#c" }));
+		const store = new StateStore(files, PATH);
+		await store.load("a/b#c");
+		expect(store.state.files).toEqual({});
+		expect(store.rebaselined).toBe(true);
 	});
 });
 

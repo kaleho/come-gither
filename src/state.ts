@@ -44,20 +44,21 @@ export class StateStore {
 		try {
 			const raw = new TextDecoder().decode(await this.files.readBinary(this.path));
 			const parsed = JSON.parse(raw);
-			// Corrupt or future-versioned state is never trusted: fall back to a
-			// re-baseline (slow, never destructive) rather than guessing.
-			this.state = parsed.version === 1 ? parsed : empty();
-			this.rebaselined = parsed.version !== 1;
+			// Corrupt, future-versioned, or misshapen state is never trusted:
+			// fall back to a re-baseline (slow, never destructive).
+			const usable = parsed !== null && parsed.version === 1 && typeof parsed.files === "object" && parsed.files !== null;
+			this.state = usable ? parsed : empty();
+			this.rebaselined = !usable;
 		} catch {
 			this.state = empty();
 			this.rebaselined = exists; // a fresh vault has no file and is not a re-baseline
 		}
 		if (expectedRemote !== undefined) {
-			// Entries tracked against another repo or branch must never be
-			// trusted: every path absent from the new remote would read as a
-			// clean remote deletion and be removed from the vault. A file with
-			// no stamp predates the stamp; adopt it once.
-			if (this.state.remote !== undefined && this.state.remote !== expectedRemote) {
+			// Entries tracked against another repo or branch — or with no stamp
+			// at all, which may be either — must never be trusted: every path
+			// absent from the new remote would read as a clean remote deletion
+			// and be removed from the vault.
+			if (exists && this.state.remote !== expectedRemote) {
 				this.state = empty();
 				this.rebaselined = true;
 			}

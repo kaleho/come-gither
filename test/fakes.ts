@@ -122,7 +122,6 @@ export class FakeGitHub {
 	modes = new Map<string, string>();
 	blobFetches: string[] = [];
 	treeFetches: string[] = [];
-	failNextBlobFetches = 0;
 	/** Fail the nth getBlobRaw call of the test (0-based), once. */
 	failBlobFetchAtIndex: number | null = null;
 	truncateRecursive = false;
@@ -211,6 +210,8 @@ export class FakeGitHub {
 	failUpdateRefTimes = 0;
 	/** Test hook: awaited at the top of createBlob, so a test can hold a push mid-flight. */
 	onCreateBlob?: () => Promise<void> | void;
+	/** Test hook: called at the top of updateRef, before any failure injection. */
+	onUpdateRef?: () => void;
 	private pushCounter = 0;
 
 	createBlobCalls = 0;
@@ -258,6 +259,7 @@ export class FakeGitHub {
 	}
 
 	async updateRef(_branch: string, sha: string): Promise<void> {
+		if (this.onUpdateRef) this.onUpdateRef();
 		if (this.failUpdateRefTimes > 0) {
 			this.failUpdateRefTimes -= 1;
 			throw new GitHubError(422, "not-fast-forward", "fake: ref moved");
@@ -273,10 +275,6 @@ export class FakeGitHub {
 
 	async getBlobRaw(sha: string): Promise<ArrayBuffer> {
 		const index = this.blobFetchCount++;
-		if (this.failNextBlobFetches > 0) {
-			this.failNextBlobFetches -= 1;
-			throw new Error("network dropped");
-		}
 		if (this.failBlobFetchAtIndex === index) {
 			this.failBlobFetchAtIndex = null;
 			throw new Error("network dropped");

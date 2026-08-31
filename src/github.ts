@@ -92,7 +92,8 @@ export class GitHubClient {
 	}
 
 	async createBlob(data: ArrayBuffer): Promise<string> {
-		const wait = this.lastWriteAt + WRITE_INTERVAL_MS - this.now();
+		// Capped: a backwards wall-clock step must never stall the push silently.
+		const wait = Math.min(this.lastWriteAt + WRITE_INTERVAL_MS - this.now(), WRITE_INTERVAL_MS);
 		if (wait > 0) await this.sleep(wait);
 		this.lastWriteAt = this.now();
 		const res = await this.call("POST", "/git/blobs", {
