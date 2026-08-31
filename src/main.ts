@@ -17,6 +17,7 @@ import type { Files, Http, HttpRequest, HttpResponse } from "./ports";
 import { StateStore } from "./state";
 import { DEFAULT_TEXT_EXTENSIONS, SyncEngine } from "./sync";
 import type { PullSummary, PushSummary, SyncPlan } from "./sync";
+import { cacheBustedUrl, clampSyncMinutes, lowercaseHeaders, parentDirs } from "./wire";
 
 interface ComeGitherSettings {
 	owner: string;
@@ -47,15 +48,11 @@ const MAX_PUSH_BYTES = 30 * 1048576;
 class ObsidianHttp implements Http {
 	async request(req: HttpRequest): Promise<HttpResponse> {
 		const method = req.method ?? "GET";
-		let url = req.url;
-		if (method === "GET") {
-			// The iOS URL cache honors GitHub's max-age=60 and serves stale refs
-			// for up to a minute after a push, which breaks fast-forward updates.
-			// Bust the cache per request and ask the cache layer to revalidate.
-			url += (url.includes("?") ? "&" : "?") + `cb=${Date.now()}`;
-		}
+		// The iOS URL cache honors GitHub's max-age=60 and serves stale refs
+		// for up to a minute after a push, which breaks fast-forward updates.
+		// Bust the cache per request and ask the cache layer to revalidate.
 		const res = await requestUrl({
-			url,
+			url: cacheBustedUrl(req.url, method),
 			method,
 			headers: { "Cache-Control": "no-cache", ...req.headers },
 			body: req.body,
@@ -63,9 +60,7 @@ class ObsidianHttp implements Http {
 		});
 		return {
 			status: res.status,
-			headers: Object.fromEntries(
-				Object.entries(res.headers).map(([k, v]) => [k.toLowerCase(), v]),
-			),
+			headers: lowercaseHeaders(res.headers),
 			arrayBuffer: res.arrayBuffer,
 			text: res.text,
 		};
@@ -88,9 +83,7 @@ class AdapterFiles implements Files {
 
 	async writeBinary(path: string, data: ArrayBuffer): Promise<void> {
 		const norm = normalizePath(path);
-		const parts = norm.split("/").slice(0, -1);
-		for (let i = 1; i <= parts.length; i++) {
-			const dir = parts.slice(0, i).join("/");
+		for (const dir of parentDirs(norm)) {
 			if (!(await this.adapter.exists(dir))) await this.adapter.mkdir(dir);
 		}
 		await this.adapter.writeBinary(norm, data);
@@ -352,8 +345,8 @@ export default class ComeGitherPlugin extends Plugin {
 			window.clearInterval(this.intervalId);
 			this.intervalId = null;
 		}
-		if (this.settings.autoSyncMinutes > 0) {
-			const minutes = Math.min(60, Math.max(3, this.settings.autoSyncMinutes));
+		const minutes = clampSyncMinutes(this.settings.autoSyncMinutes);
+		if (minutes > 0) {
 			this.intervalId = window.setInterval(() => void this.runSync(false, true), minutes * 60_000);
 			this.registerInterval(this.intervalId);
 		}
@@ -652,7 +645,7 @@ class ComeGitherSettingTab extends PluginSettingTab {
 				t.setValue(String(s.autoSyncMinutes)).onChange((v) => {
 					const n = Number(v);
 					if (Number.isFinite(n) && n >= 0) {
-						s.autoSyncMinutes = n === 0 ? 0 : Math.min(60, Math.max(3, Math.round(n)));
+						s.autoSyncMinutes = clampSyncMinutes(n);
 						save();
 					}
 				}),
