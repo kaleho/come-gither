@@ -115,6 +115,9 @@ export class SyncEngine {
 	private uploadedBlobs = new Map<string, string>();
 
 	private locked<T>(fn: () => Promise<T>): Promise<T> {
+		if (this.retired) {
+			return Promise.reject(new Error("the sync engine was retired (settings changed); try again"));
+		}
 		const prev = this.chain;
 		const run = (async () => {
 			await prev.catch(() => {});
@@ -128,6 +131,13 @@ export class SyncEngine {
 	idle(): Promise<void> {
 		return this.chain.then(() => undefined);
 	}
+
+	/** Refuse new operations; queued ones finish. Used when settings replace the engine. */
+	retire(): void {
+		this.retired = true;
+	}
+
+	private retired = false;
 
 	fetchLazy(path: string): Promise<"fetched" | "not-lazy" | "modified"> {
 		return this.locked(() => this.doFetchLazy(path));
@@ -217,8 +227,14 @@ export class SyncEngine {
 				const { action } = await this.classifyIncoming(path, blob, entry, false);
 				plan.incoming.push({ path, action });
 			}
+			const remoteLower = new Set([...remote.keys()].map((p) => p.toLowerCase()));
 			for (const path of Object.keys(this.state.state.files)) {
 				if (remote.has(path) || this.excluded(path)) continue;
+				if (remoteLower.has(path.toLowerCase())) {
+					// Case-only rename: the sync only drops the stale entry.
+					agreedDeleted.add(path);
+					continue;
+				}
 				const localSha = await this.localShaIfChanged(path, this.state.state.files[path], false);
 				if (localSha === "missing") {
 					// Deleted on both sides: the sync only drops the entry.
@@ -265,8 +281,12 @@ export class SyncEngine {
 		const entry = this.state.state.files[path];
 		if (!entry) {
 			if ((await this.files.stat(path)) === null) return "clean";
+			// The only copy of an untracked file: park it before removing. A
+			// conflict-kept file shows as "New file" in the preview, and its
+			// Revert button must never destroy the last copy.
+			await this.files.writeBinary(`_conflicts/${path}`, await this.files.readBinary(path));
 			await this.files.remove(path);
-			this.log("info", `reverted ${path}: removed the new file`);
+			this.log("info", `reverted ${path}: removed the new file (a copy is in _conflicts/${path})`);
 			return "reverted";
 		}
 		if ((await this.localShaIfChanged(path, entry, false)) === "clean") return "clean";
@@ -433,8 +453,16 @@ export class SyncEngine {
 			await this.applyRemoteChange(path, blob, entry, summary);
 		}
 
+		const remoteLower = new Set([...remote.keys()].map((p) => p.toLowerCase()));
 		for (const path of Object.keys(this.state.state.files)) {
 			if (remote.has(path) || this.excluded(path)) continue;
+			if (remoteLower.has(path.toLowerCase())) {
+				// A case-only rename on GitHub: on the case-insensitive
+				// filesystems Obsidian runs on, the differently-cased twin owns
+				// the same physical file — removing this path would destroy it.
+				await this.state.removeFile(path);
+				continue;
+			}
 			await this.applyRemoteDelete(path, summary);
 		}
 
@@ -456,7 +484,7 @@ export class SyncEngine {
 		entry: FileEntry | undefined,
 		refresh: boolean,
 	): Promise<{ action: IncomingAction; localSha: string }> {
-		const localSha = await this.localShaIfChanged(path, entry, refresh);
+		const localSha = await this.localShaIfChanged(path, entry, refresh, blob.size);
 		if (localSha !== "clean") {
 			// Local content already equals the remote blob: adopt it.
 			if (localSha === blob.sha) return { action: "adopt", localSha };
@@ -558,6 +586,15 @@ export class SyncEngine {
 		}
 		if (localSha !== "clean") {
 			summary.conflicts += 1;
+			if (entry.lazy === true) {
+				// The real content was never downloaded; the local bytes are stub
+				// scribbles that must never become the file's uploaded content.
+				await this.files.writeBinary(`_conflicts/${path}`, await this.files.readBinary(path));
+				await this.files.remove(path);
+				await this.state.removeFile(path);
+				this.log("warn", `conflict on ${path}: deleted on GitHub before its content was downloaded; your local notes moved to _conflicts/${path}`);
+				return;
+			}
 			// Keep the file, drop the entry: the path no longer exists on GitHub,
 			// so a tracked entry could only make a later push emit a delete for a
 			// path absent from the base tree (GitHub rejects that with a 422).
@@ -579,10 +616,16 @@ export class SyncEngine {
 		path: string,
 		entry: FileEntry | undefined,
 		refresh = true,
+		expectedSize?: number,
 	): Promise<string> {
 		const stat = await this.files.stat(path);
 		if (!entry) {
 			if (!stat) return "clean"; // nothing local, nothing tracked
+			if (expectedSize !== undefined && stat.size !== expectedSize && stat.size > this.config.maxPushBytes) {
+				// The sizes differ, so the contents cannot match: never buffer a
+				// huge untracked file just to prove it (iPad memory).
+				return "size-differs";
+			}
 			return gitBlobSha1(await this.files.readBinary(path));
 		}
 		if (!stat) return "missing";
