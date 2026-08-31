@@ -341,6 +341,19 @@ describe("push", () => {
 });
 
 describe("sync: fast-forward retry", () => {
+	it("reuses blobs already uploaded when the push retries", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one" });
+		await engine.pull();
+		await files.writeBinary("new.md", text("fresh"));
+		gh.failUpdateRefTimes = 1;
+		const { push } = await engine.sync();
+		expect(push.commit).not.toBe(null);
+		// Blobs are content-addressed and persist server-side; a retry after
+		// not-fast-forward must not re-upload them at one request per second.
+		expect(gh.createBlobCalls).toBe(1);
+	});
+
 	it("re-pulls and retries when the ref moved under it", async () => {
 		const { gh, files, engine } = makeEngine();
 		await gh.setFiles({ "a.md": "one" });

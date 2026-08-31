@@ -371,7 +371,7 @@ export default class ComeGitherPlugin extends Plugin {
 				token: this.settings.token,
 			});
 			const state = new StateStore(this.vaultFiles, `${this.pluginDir}/sync-state.json`);
-			await state.load();
+			await state.load(`${this.settings.owner}/${this.settings.repo}#${this.settings.branch}`);
 			const engine = new SyncEngine(client, this.vaultFiles, state, this.logger.log, {
 				branch: this.settings.branch,
 				textExtensions: DEFAULT_TEXT_EXTENSIONS,

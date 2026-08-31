@@ -13,6 +13,8 @@ export interface SyncState {
 	version: 1;
 	lastSyncedCommit: string | null;
 	files: Record<string, FileEntry>;
+	/** "owner/repo#branch" the entries describe; absent only in pre-0.4 files. */
+	remote?: string;
 }
 
 const FLUSH_EVERY = 20;
@@ -33,7 +35,7 @@ export class StateStore {
 		private now: () => number = () => Date.now(),
 	) {}
 
-	async load(): Promise<void> {
+	async load(expectedRemote?: string): Promise<void> {
 		this.lastFlushAt = this.now();
 		try {
 			const raw = new TextDecoder().decode(await this.files.readBinary(this.path));
@@ -43,6 +45,16 @@ export class StateStore {
 			this.state = parsed.version === 1 ? parsed : empty();
 		} catch {
 			this.state = empty();
+		}
+		if (expectedRemote !== undefined) {
+			// Entries tracked against another repo or branch must never be
+			// trusted: every path absent from the new remote would read as a
+			// clean remote deletion and be removed from the vault. A file with
+			// no stamp predates the stamp; adopt it once.
+			if (this.state.remote !== undefined && this.state.remote !== expectedRemote) {
+				this.state = empty();
+			}
+			this.state.remote = expectedRemote;
 		}
 	}
 

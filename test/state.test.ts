@@ -46,6 +46,38 @@ describe("StateStore load", () => {
 	});
 });
 
+describe("StateStore remote identity", () => {
+	it("keeps entries for the same remote and re-baselines for a different one", async () => {
+		const files = new MemFiles();
+		const a = new StateStore(files, PATH);
+		await a.load("kaleho/vault#master");
+		await a.setFile("a.md", entry("s1"));
+		await a.setCommit("c1");
+		const same = new StateStore(files, PATH);
+		await same.load("kaleho/vault#master");
+		expect(same.state.files["a.md"]).toEqual(entry("s1"));
+		// Pointing the settings at another repo or branch must never reuse
+		// entries: trusting them would mass-delete local files on the next pull.
+		const other = new StateStore(files, PATH);
+		await other.load("kaleho/testbed#master");
+		expect(other.state.files).toEqual({});
+		expect(other.state.lastSyncedCommit).toBe(null);
+	});
+
+	it("adopts a legacy state file that has no remote stamp and stamps it", async () => {
+		const files = new MemFiles();
+		files.writeText(
+			PATH,
+			JSON.stringify({ version: 1, lastSyncedCommit: "c1", files: { "a.md": entry("s1") } }),
+		);
+		const store = new StateStore(files, PATH);
+		await store.load("kaleho/vault#master");
+		expect(store.state.files["a.md"]).toEqual(entry("s1"));
+		await store.setCommit("c2");
+		expect(JSON.parse(files.readText(PATH)).remote).toBe("kaleho/vault#master");
+	});
+});
+
 describe("StateStore flush cadence", () => {
 	it("does not write on every setFile", async () => {
 		const { store, files } = makeStore();
