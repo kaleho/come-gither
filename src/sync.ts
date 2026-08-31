@@ -151,7 +151,7 @@ export class SyncEngine {
 		return this.locked(() => this.doPreview());
 	}
 
-	revert(path: string): Promise<"reverted" | "clean"> {
+	revert(path: string): Promise<"reverted" | "reverted-new" | "clean"> {
 		return this.locked(() => this.doRevert(path));
 	}
 
@@ -215,6 +215,10 @@ export class SyncEngine {
 	private async doPreview(): Promise<SyncPlan> {
 		const plan: SyncPlan = { headMoved: false, incoming: [], outgoing: [] };
 		const agreedDeleted = new Set<string>();
+		const localPaths = new Set(
+			(await this.files.listRecursive("")).filter((p) => !this.excluded(p)),
+		);
+		const localLower = new Set([...localPaths].map((p) => p.toLowerCase()));
 		const head = await this.gh.getRef(this.config.branch);
 		if (head !== this.state.state.lastSyncedCommit) {
 			plan.headMoved = true;
@@ -231,9 +235,13 @@ export class SyncEngine {
 			for (const path of Object.keys(this.state.state.files)) {
 				if (remote.has(path) || this.excluded(path)) continue;
 				if (remoteLower.has(path.toLowerCase())) {
-					// Case-only rename: the sync only drops the stale entry.
-					agreedDeleted.add(path);
-					continue;
+					const folded = [...localPaths].filter((p) => p.toLowerCase() === path.toLowerCase());
+					if (folded.length <= 1) {
+						// Case-only rename on one physical file: sync only drops
+						// the stale entry.
+						agreedDeleted.add(path);
+						continue;
+					}
 				}
 				const localSha = await this.localShaIfChanged(path, this.state.state.files[path], false);
 				if (localSha === "missing") {
@@ -244,9 +252,6 @@ export class SyncEngine {
 				plan.incoming.push({ path, action: localSha === "clean" ? "delete" : "keep-local" });
 			}
 		}
-		const localPaths = new Set(
-			(await this.files.listRecursive("")).filter((p) => !this.excluded(p)),
-		);
 		for (const path of localPaths) {
 			const entry = this.state.state.files[path];
 			const stat = await this.files.stat(path);
@@ -266,30 +271,45 @@ export class SyncEngine {
 				continue;
 			}
 			if (!entry && localSha === EMPTY_BLOB_SHA) continue; // stale stub: push leaves it for pull
+			if (!entry) {
+				const twinKey = this.caseTwinEntryKey(path);
+				if (twinKey !== undefined && localSha === this.state.state.files[twinKey].baseBlobSha) {
+					continue; // case-only rename: push keeps the GitHub casing
+				}
+			}
 			plan.outgoing.push({ path, action: entry ? "modified" : "new" });
 		}
+		const uploads = new Set(
+			plan.outgoing.filter((r) => r.action === "new" || r.action === "modified").map((r) => r.path.toLowerCase()),
+		);
 		for (const path of Object.keys(this.state.state.files)) {
 			const entry = this.state.state.files[path];
 			if (localPaths.has(path) || agreedDeleted.has(path) || this.excluded(path)) continue;
+			if (!entry.lazy && localLower.has(path.toLowerCase()) && !uploads.has(path.toLowerCase())) {
+				continue; // a case twin exists on disk and push will not delete it
+			}
 			plan.outgoing.push({ path, action: entry.lazy ? "restore-placeholder" : "deleted" });
 		}
 		return plan;
 	}
 
 	/** Discard a local change: restore the last-synced content (or stub), or delete a new file. */
-	private async doRevert(path: string): Promise<"reverted" | "clean"> {
+	private async doRevert(path: string): Promise<"reverted" | "reverted-new" | "clean"> {
 		const entry = this.state.state.files[path];
 		if (!entry) {
 			if ((await this.files.stat(path)) === null) return "clean";
 			// The only copy of an untracked file: park it before removing. A
 			// conflict-kept file shows as "New file" in the preview, and its
 			// Revert button must never destroy the last copy.
-			await this.files.writeBinary(`_conflicts/${path}`, await this.files.readBinary(path));
+			const parked = await this.park(path, await this.files.readBinary(path));
 			await this.files.remove(path);
-			this.log("info", `reverted ${path}: removed the new file (a copy is in _conflicts/${path})`);
-			return "reverted";
+			this.log("info", `reverted ${path}: removed the new file (a copy is in ${parked})`);
+			return "reverted-new";
 		}
-		if ((await this.localShaIfChanged(path, entry, false)) === "clean") return "clean";
+		// A lazy entry with real bytes on disk is never clean for revert: the
+		// stub must come back even when a closing editor rewrote the base bytes.
+		const dirtyStub = entry.lazy === true && (((await this.files.stat(path))?.size ?? 0) > 0);
+		if (!dirtyStub && (await this.localShaIfChanged(path, entry, false)) === "clean") return "clean";
 		if (entry.lazy) {
 			await this.files.writeBinary(path, new ArrayBuffer(0));
 			await this.record(path, entry.baseBlobSha, true, entry.remoteSize, entry.mode);
@@ -343,6 +363,18 @@ export class SyncEngine {
 				this.log("info", `${path} is an untracked empty file; not pushing it until it has content`);
 				continue;
 			}
+			if (!entry) {
+				const twinKey = this.caseTwinEntryKey(path);
+				if (twinKey !== undefined) {
+					if (localSha === this.state.state.files[twinKey].baseBlobSha) {
+						// A case-only rename: the twin entry already tracks this
+						// content, and pushing it as a new path would commit a
+						// case collision into the repository.
+						continue;
+					}
+					this.log("warn", `${path} differs from tracked ${twinKey} only by case; pushing it can create a case collision in the repository`);
+				}
+			}
 			// One read serves both the cache key and the upload, so the cache can
 			// never map one file's content sha to another file's uploaded bytes.
 			const data = await this.files.readBinary(path);
@@ -362,6 +394,7 @@ export class SyncEngine {
 
 		const droppedPaths: string[] = [];
 		let restoredPlaceholders = 0;
+		const localLower = new Set([...localPaths].map((p) => p.toLowerCase()));
 		for (const path of Object.keys(this.state.state.files)) {
 			if (localPaths.has(path)) continue;
 			if (this.excluded(path)) {
@@ -380,6 +413,15 @@ export class SyncEngine {
 				restoredPlaceholders += 1;
 				this.log("info", `restored the placeholder for ${path}`);
 				continue;
+			}
+			if (localLower.has(path.toLowerCase())) {
+				// A case twin of this entry exists on disk. Emit the delete only
+				// when the twin's content actually landed in this commit; a
+				// skipped upload plus a delete would remove the file from GitHub.
+				const uploaded = treeEntries.some(
+					(e) => e.sha !== null && e.path.toLowerCase() === path.toLowerCase(),
+				);
+				if (!uploaded) continue;
 			}
 			treeEntries.push({ path, mode: "100644", type: "blob", sha: null });
 			droppedPaths.push(path);
@@ -454,14 +496,20 @@ export class SyncEngine {
 		}
 
 		const remoteLower = new Set([...remote.keys()].map((p) => p.toLowerCase()));
+		let localList: string[] | null = null;
 		for (const path of Object.keys(this.state.state.files)) {
 			if (remote.has(path) || this.excluded(path)) continue;
 			if (remoteLower.has(path.toLowerCase())) {
-				// A case-only rename on GitHub: on the case-insensitive
-				// filesystems Obsidian runs on, the differently-cased twin owns
-				// the same physical file — removing this path would destroy it.
-				await this.state.removeFile(path);
-				continue;
+				// A case-only rename on GitHub. On a case-insensitive filesystem
+				// the differently-cased twin owns the same physical file, and
+				// removing this path would destroy it; on a case-sensitive one
+				// both casings are distinct files and the delete is real.
+				localList ??= await this.files.listRecursive("");
+				const folded = localList.filter((p) => p.toLowerCase() === path.toLowerCase());
+				if (folded.length <= 1) {
+					await this.state.removeFile(path);
+					continue;
+				}
 			}
 			await this.applyRemoteDelete(path, summary);
 		}
@@ -517,14 +565,21 @@ export class SyncEngine {
 			await this.resolveConflict(path, blob, entry, localSha, summary);
 			return;
 		}
+		if (action === "overwrite" && localSha === "size-differs") {
+			// The local file is too large to buffer for a _conflicts park: keep
+			// it untouched rather than destroy bytes we cannot copy.
+			summary.conflicts += 1;
+			this.log("warn", `conflict on ${path}: the local file is too large to save to _conflicts/; kept it; resolve from desktop git`);
+			return;
+		}
 		if (action === "overwrite" && localSha !== "missing") {
 			const why = this.inConfigDir(path) ? "the config folder always takes the GitHub version" : "policy: remote wins";
 			this.log("warn", `overwriting local changes to ${path} (${why})`);
 			if (this.isLazyTarget(path, blob.size)) {
 				// The new state is a stub, so the changed local bytes would
 				// otherwise exist nowhere: keep a copy first.
-				await this.files.writeBinary(`_conflicts/${path}`, await this.files.readBinary(path));
-				this.log("warn", `saved the local version of ${path} to _conflicts/${path}`);
+				const parked = await this.park(path, await this.files.readBinary(path));
+				this.log("warn", `saved the local version of ${path} to ${parked}`);
 			}
 		}
 		if (this.isLazyTarget(path, blob.size)) {
@@ -569,9 +624,9 @@ export class SyncEngine {
 				}
 			}
 		}
-		await this.files.writeBinary(`_conflicts/${path}`, remoteData);
+		const parked = await this.park(path, remoteData);
 		summary.conflicts += 1;
-		this.log("warn", `conflict on ${path}: kept the local version, saved the remote one to _conflicts/${path}`);
+		this.log("warn", `conflict on ${path}: kept the local version, saved the remote one to ${parked}`);
 	}
 
 	private async applyRemoteDelete(path: string, summary: PullSummary): Promise<void> {
@@ -589,10 +644,10 @@ export class SyncEngine {
 			if (entry.lazy === true) {
 				// The real content was never downloaded; the local bytes are stub
 				// scribbles that must never become the file's uploaded content.
-				await this.files.writeBinary(`_conflicts/${path}`, await this.files.readBinary(path));
+				const parked = await this.park(path, await this.files.readBinary(path));
 				await this.files.remove(path);
 				await this.state.removeFile(path);
-				this.log("warn", `conflict on ${path}: deleted on GitHub before its content was downloaded; your local notes moved to _conflicts/${path}`);
+				this.log("warn", `conflict on ${path}: deleted on GitHub before its content was downloaded; your local notes moved to ${parked}`);
 				return;
 			}
 			// Keep the file, drop the entry: the path no longer exists on GitHub,
@@ -687,6 +742,28 @@ export class SyncEngine {
 
 	private isLazyTarget(path: string, size: number): boolean {
 		return size > this.config.maxAutoFetchBytes || (!this.isText(path) && !this.inConfigDir(path));
+	}
+
+	/** The key of a tracked entry that differs from this path only by case. */
+	private caseTwinEntryKey(path: string): string | undefined {
+		const lower = path.toLowerCase();
+		for (const key of Object.keys(this.state.state.files)) {
+			if (key !== path && key.toLowerCase() === lower) return key;
+		}
+		return undefined;
+	}
+
+	/**
+	 * Save a copy under _conflicts/ without ever clobbering an earlier parked
+	 * copy (which can be the only copy of some content). Returns the name used.
+	 */
+	private async park(path: string, data: ArrayBuffer): Promise<string> {
+		let target = `_conflicts/${path}`;
+		for (let n = 1; (await this.files.stat(target)) !== null; n++) {
+			target = `_conflicts/${path}.${n}`;
+		}
+		await this.files.writeBinary(target, data);
+		return target;
 	}
 
 	private inConfigDir(path: string): boolean {

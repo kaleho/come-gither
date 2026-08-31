@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_TEXT_EXTENSIONS, SyncEngine } from "../src/sync";
 import { StateStore } from "../src/state";
-import { FakeGitHub, MemFiles, gitSha } from "./fakes";
+import { CaseFoldMemFiles, FakeGitHub, MemFiles, gitSha } from "./fakes";
 
 const STATE_PATH = ".obsidian/plugins/come-gither/sync-state.json";
 
@@ -12,10 +12,11 @@ function makeEngine(
 		conflictPolicy?: "merge" | "remote-wins";
 		configDir?: string;
 		excludedPrefixes?: string[];
+		files?: MemFiles;
 	} = {},
 ) {
 	const gh = new FakeGitHub();
-	const files = new MemFiles();
+	const files = overrides.files ?? new MemFiles();
 	const state = new StateStore(files, STATE_PATH);
 	const logs: string[] = [];
 	const engine = new SyncEngine(gh, files, state, (level, msg) => logs.push(`${level}: ${msg}`), {
@@ -365,15 +366,74 @@ describe("revert safety net", () => {
 		await gh.setFiles({ "a.md": "base" });
 		await engine.pull();
 		await files.writeBinary("note.md", text("precious"));
-		expect(await engine.revert("note.md")).toBe("reverted");
+		expect(await engine.revert("note.md")).toBe("reverted-new");
 		expect(await files.stat("note.md")).toBeNull();
 		expect(files.readText("_conflicts/note.md")).toBe("precious");
+	});
+
+	it("parks to a suffixed name instead of clobbering an earlier only-copy", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "base" });
+		await engine.pull();
+		await files.writeBinary("note.md", text("first"));
+		await engine.revert("note.md");
+		await files.writeBinary("note.md", text("second"));
+		await engine.revert("note.md");
+		expect(files.readText("_conflicts/note.md")).toBe("first");
+		expect(files.readText("_conflicts/note.md.1")).toBe("second");
+	});
+
+	it("restores the stub for a deleted placeholder", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "big.pdf": new Uint8Array([1, 2, 3]) });
+		await engine.pull();
+		await files.remove("big.pdf");
+		expect(await engine.revert("big.pdf")).toBe("reverted");
+		expect((await files.stat("big.pdf"))?.size).toBe(0);
+	});
+
+	it("restores the stub for a lazy entry even when the disk holds the base content", async () => {
+		// The evict re-stub path: a closing editor saved the pre-evict content
+		// back over the stub; that content hashes to baseBlobSha, but a lazy
+		// entry with real bytes on disk is never clean for revert purposes.
+		const { gh, files, state, engine } = makeEngine();
+		const bytes = new Uint8Array([1, 2, 3]);
+		await gh.setFiles({ "big.pdf": bytes });
+		await engine.pull();
+		await engine.fetchLazy("big.pdf");
+		await engine.evict("big.pdf");
+		await files.writeBinary("big.pdf", bytes.buffer.slice(0) as ArrayBuffer); // editor save-back
+		expect(await engine.revert("big.pdf")).toBe("reverted");
+		expect((await files.stat("big.pdf"))?.size).toBe(0);
+		expect(state.state.files["big.pdf"].lazy).toBe(true);
+	});
+});
+
+describe("oversize local files under remote-wins", () => {
+	it("keeps the local file instead of buffering it for a _conflicts park", async () => {
+		const { gh, files, engine, logs } = makeEngine({ conflictPolicy: "remote-wins", maxPushBytes: 4 });
+		await gh.setFiles({ "keep.md": "k" });
+		await engine.pull();
+		await files.writeBinary("video.mp4", text("huge local bytes over the cap"));
+		await gh.setFiles({ "keep.md": "k", "video.mp4": new Uint8Array([9, 9]) });
+		const reads: string[] = [];
+		const orig = files.readBinary.bind(files);
+		files.readBinary = async (p) => {
+			reads.push(p);
+			return orig(p);
+		};
+		const summary = await engine.pull();
+		expect(summary.conflicts).toBe(1);
+		expect(reads).not.toContain("video.mp4");
+		expect(files.readText("video.mp4")).toBe("huge local bytes over the cap");
+		expect(logs.some((l) => l.includes("video.mp4"))).toBe(true);
 	});
 });
 
 describe("case-only remote renames", () => {
-	it("never deletes the local file when a case-folded twin exists remotely", async () => {
-		const { gh, files, state, engine } = makeEngine();
+	it("keeps the single physical file on a case-insensitive filesystem", async () => {
+		const files = new CaseFoldMemFiles();
+		const { gh, state, engine } = makeEngine({ files });
 		await gh.setFiles({ "note.md": "content" });
 		await engine.pull();
 		// GitHub now holds the same path with different casing.
@@ -381,10 +441,69 @@ describe("case-only remote renames", () => {
 		const plan = await engine.preview();
 		expect(plan.incoming.find((r) => r.path === "note.md")).toBeUndefined();
 		await engine.pull();
-		// On a case-insensitive filesystem both names are one file; removing
-		// "note.md" would destroy it. The stale entry drops, the file stays.
+		// Both names are one file here; removing "note.md" would destroy it.
 		expect(await files.stat("note.md")).not.toBeNull();
 		expect(state.state.files["note.md"]).toBeUndefined();
+		expect(state.state.files["Note.md"]).toBeDefined();
+		// The follow-up push must neither re-upload nor delete anything.
+		const push = await engine.push();
+		expect(push.commit).toBe(null);
+		expect(push.deletedRemote).toBe(0);
+		expect(gh.filesByPath.has("Note.md")).toBe(true);
+	});
+
+	it("applies the rename as two files on a case-sensitive filesystem", async () => {
+		const { gh, files, state, engine } = makeEngine();
+		await gh.setFiles({ "note.md": "content" });
+		await engine.pull();
+		await gh.setFiles({ "Note.md": "content" });
+		await engine.pull();
+		// Distinct physical files here: the old casing is a real remote delete.
+		expect(await files.stat("note.md")).toBeNull();
+		expect(await files.stat("Note.md")).not.toBeNull();
+		expect(state.state.files["note.md"]).toBeUndefined();
+	});
+
+	it("never deletes the remote file when a local case-rename's upload was skipped", async () => {
+		const files = new CaseFoldMemFiles();
+		const { gh, state, engine } = makeEngine({ files, maxPushBytes: 4 });
+		await gh.setFiles({ "big.md": "elevenbytes" });
+		await engine.pull();
+		files.renameCase("big.md", "Big.md");
+		const push = await engine.push();
+		// The re-upload of the new casing is over the cap; emitting the delete
+		// anyway would remove the file from GitHub entirely.
+		expect(push.deletedRemote).toBe(0);
+		expect(gh.filesByPath.has("big.md")).toBe(true);
+		expect(state.state.files["big.md"]).toBeDefined();
+	});
+
+	it("does not push a clean local case-rename as a colliding new file", async () => {
+		const files = new CaseFoldMemFiles();
+		const { gh, engine } = makeEngine({ files });
+		await gh.setFiles({ "note.md": "content" });
+		await engine.pull();
+		files.renameCase("note.md", "Note.md");
+		const plan = await engine.preview();
+		expect(plan.outgoing).toEqual([]);
+		const push = await engine.push();
+		expect(push.commit).toBe(null);
+		expect(gh.createBlobCalls).toBe(0);
+	});
+
+	it("propagates a case rename with edits and logs the collision risk", async () => {
+		const files = new CaseFoldMemFiles();
+		const { gh, engine, logs } = makeEngine({ files });
+		await gh.setFiles({ "note.md": "content" });
+		await engine.pull();
+		files.renameCase("note.md", "Note.md");
+		await files.writeBinary("Note.md", text("edited"));
+		const push = await engine.push();
+		expect(push.pushed).toBe(1);
+		expect(push.deletedRemote).toBe(1);
+		expect(logs.some((l) => l.includes("only by case"))).toBe(true);
+		expect(gh.filesByPath.has("Note.md")).toBe(true);
+		expect(gh.filesByPath.has("note.md")).toBe(false);
 	});
 });
 
@@ -1039,7 +1158,7 @@ describe("revert", () => {
 		await gh.setFiles({ "a.md": "base" });
 		await engine.pull();
 		await files.writeBinary("new.md", text("scratch"));
-		expect(await engine.revert("new.md")).toBe("reverted");
+		expect(await engine.revert("new.md")).toBe("reverted-new");
 		expect(await files.stat("new.md")).toBeNull();
 	});
 
@@ -1379,7 +1498,7 @@ describe("operation serialization", () => {
 		const failing = engine.sync().catch((e) => e);
 		const reverting = engine.revert("new.md");
 		expect((await failing).kind).toBe("not-fast-forward");
-		expect(await reverting).toBe("reverted");
+		expect(await reverting).toBe("reverted-new");
 		expect(await files.stat("new.md")).toBeNull();
 	});
 });

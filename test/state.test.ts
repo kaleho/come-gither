@@ -107,6 +107,23 @@ describe("StateStore remote identity", () => {
 		await expect(store.load("a/b#c")).resolves.toBeUndefined();
 		expect(store.state.files).toEqual({});
 	});
+
+	it("still applies the identity guard when stat fails but the read succeeds", async () => {
+		// A successful read proves the file exists; the stat hiccup must never
+		// let another repo's entries be adopted (that path mass-deletes files).
+		const files = new MemFiles();
+		files.writeText(
+			PATH,
+			JSON.stringify({ version: 1, lastSyncedCommit: "c1", files: { "a.md": entry("s1") }, remote: "x/y#z" }),
+		);
+		files.stat = async () => {
+			throw new Error("adapter hiccup");
+		};
+		const store = new StateStore(files, PATH);
+		await store.load("a/b#c");
+		expect(store.state.files).toEqual({});
+		expect(store.rebaselined).toBe(true);
+	});
 });
 
 describe("StateStore rebaselined flag", () => {

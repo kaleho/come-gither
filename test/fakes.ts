@@ -92,6 +92,48 @@ export class MemFiles implements Files {
 	}
 }
 
+/**
+ * MemFiles on a case-insensitive filesystem (the iPad's APFS default): every
+ * path operation resolves to an existing key that case-folds to the same name,
+ * and a file keeps its original casing when written through a different one.
+ */
+export class CaseFoldMemFiles extends MemFiles {
+	private resolve(path: string): string {
+		const lower = path.toLowerCase();
+		for (const key of this.store.keys()) {
+			if (key.toLowerCase() === lower) return key;
+		}
+		return path;
+	}
+
+	override async readBinary(path: string): Promise<ArrayBuffer> {
+		return super.readBinary(this.resolve(path));
+	}
+
+	override async writeBinary(path: string, data: ArrayBuffer): Promise<void> {
+		return super.writeBinary(this.resolve(path), data);
+	}
+
+	override async stat(path: string): Promise<{ mtime: number; size: number } | null> {
+		return super.stat(this.resolve(path));
+	}
+
+	override async remove(path: string): Promise<void> {
+		return super.remove(this.resolve(path));
+	}
+
+	/** A user rename that changes only the casing of an existing file. */
+	renameCase(from: string, to: string): void {
+		const data = this.store.get(from);
+		if (data === undefined) throw new Error(`ENOENT: ${from}`);
+		const mtime = this.mtimes.get(from) ?? 0;
+		this.store.delete(from);
+		this.mtimes.delete(from);
+		this.store.set(to, data);
+		this.mtimes.set(to, mtime + 1);
+	}
+}
+
 /** Git blob SHA-1 of raw bytes, independent of the implementation under test. */
 export async function gitSha(data: Uint8Array | string): Promise<string> {
 	const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;

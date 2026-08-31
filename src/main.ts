@@ -347,6 +347,7 @@ export default class ComeGitherPlugin extends Plugin {
 		// retire it (new operations refuse; queued ones finish) and rebuild
 		// lazily on next use, after the retired engine's queue drains. Two
 		// engines can never run over the same files and state.
+		this.rebaselineNoticed = false; // a settings change opens a new episode
 		const old = this.sessionPromise;
 		if (old !== null) {
 			this.sessionPromise = null;
@@ -449,9 +450,11 @@ export default class ComeGitherPlugin extends Plugin {
 			const engine = await this.getEngine();
 			const result = await engine.revert(path);
 			new Notice(
-				result === "reverted"
-					? `Come Gither: reverted ${path}.`
-					: `Come Gither: ${path} has no local changes.`,
+				result === "reverted-new"
+					? `Come Gither: reverted ${path}. A copy is in _conflicts/.`
+					: result === "reverted"
+						? `Come Gither: reverted ${path}.`
+						: `Come Gither: ${path} has no local changes.`,
 			);
 		} catch (e) {
 			new Notice(`Come Gither: revert failed — ${e instanceof Error ? e.message : String(e)}`);
@@ -631,8 +634,10 @@ export default class ComeGitherPlugin extends Plugin {
 				this.detachLeavesShowing(file.path);
 				// A dirty editor buffer can save itself while its view closes,
 				// writing the full content back over the stub. Verify and redo.
+				// A retire mid-evict must not turn the finished evict into an
+				// error Notice; the next sync heals the entry either way.
 				const stat = await this.vaultFiles.stat(file.path);
-				if (stat && stat.size > 0) await engine.revert(file.path);
+				if (stat && stat.size > 0) await engine.revert(file.path).catch(() => {});
 				new Notice(`Come Gither: removed the local copy of ${file.name}. It stays on GitHub.`);
 			} else if (result === "modified") {
 				new Notice(`Come Gither: ${file.name} has unpushed changes. Sync first.`);
