@@ -113,6 +113,8 @@ interface RemoteFile {
 export class FakeGitHub {
 	head = "commit-0";
 	filesByPath = new Map<string, RemoteFile>();
+	/** Optional per-path git mode; getTree serves "100644" for unlisted paths. */
+	modes = new Map<string, string>();
 	blobFetches: string[] = [];
 	treeFetches: string[] = [];
 	failNextBlobFetches = 0;
@@ -142,9 +144,9 @@ export class FakeGitHub {
 
 	async getTree(sha: string, recursive: boolean) {
 		this.treeFetches.push(`${sha}:${recursive}`);
-		const blob = (path: string, f: RemoteFile) => ({
+		const blob = (path: string, f: RemoteFile, fullPath = path) => ({
 			path,
-			mode: "100644",
+			mode: this.modes.get(fullPath) ?? "100644",
 			type: "blob" as const,
 			sha: f.sha,
 			size: f.size,
@@ -172,7 +174,7 @@ export class FakeGitHub {
 			if (!p.startsWith(prefix)) continue;
 			const rest = p.slice(prefix.length);
 			const slash = rest.indexOf("/");
-			if (slash === -1) seen.set(rest, blob(rest, f));
+			if (slash === -1) seen.set(rest, blob(rest, f, p));
 			else {
 				const dir = rest.slice(0, slash);
 				seen.set(dir, { path: dir, mode: "040000", type: "tree", sha: `dir:${prefix}${dir}/` });

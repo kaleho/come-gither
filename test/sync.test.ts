@@ -744,6 +744,199 @@ describe("revert", () => {
 	});
 });
 
+describe("both-sides deletions", () => {
+	it("treats a file deleted on both sides as agreement, not a conflict", async () => {
+		const { gh, files, state, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "x", "b.md": "keep" });
+		await engine.pull();
+		await files.remove("a.md");
+		await gh.setFiles({ "b.md": "keep" });
+		const summary = await engine.pull();
+		expect(summary.conflicts).toBe(0);
+		expect(summary.deleted).toBe(1);
+		expect(state.state.files["a.md"]).toBeUndefined();
+		// The zombie entry is gone, so push never emits a delete for a path
+		// absent from the base tree (GitHub rejects that with a 422).
+		const push = await engine.push();
+		expect(push.deletedRemote).toBe(0);
+		expect(push.commit).toBe(null);
+	});
+
+	it("preview shows no row for a file deleted on both sides", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "x", "b.md": "keep" });
+		await engine.pull();
+		await files.remove("a.md");
+		await gh.setFiles({ "b.md": "keep" });
+		const plan = await engine.preview();
+		expect(plan.incoming).toEqual([]);
+		expect(plan.outgoing).toEqual([]);
+	});
+});
+
+describe("push protections", () => {
+	it("leaves an untracked empty stub alone even when the head has not moved", async () => {
+		const { gh, files, state, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "x", "photo.png": new Uint8Array([1, 2, 3]) });
+		await engine.pull();
+		// Simulate a lost state entry: the stub file exists but nothing tracks it.
+		await state.removeFile("photo.png");
+		const push = await engine.push();
+		expect(push.commit).toBe(null);
+		const plan = await engine.preview();
+		expect(plan.outgoing).toEqual([]);
+	});
+
+	it("records the fingerprint captured at read time, so a mid-push edit is still pushed later", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one" });
+		await engine.pull();
+		await files.writeBinary("a.md", text("edited"));
+		gh.onCreateBlob = async () => {
+			gh.onCreateBlob = undefined;
+			await files.writeBinary("a.md", text("edited again"));
+		};
+		await engine.push();
+		const second = await engine.push();
+		expect(second.pushed).toBe(1);
+		expect(gh.createdBlobs.has(await gitSha("edited again"))).toBe(true);
+	});
+
+	it("skips an oversize file without reading its content", async () => {
+		const { gh, files, engine } = makeEngine({ maxPushBytes: 4 });
+		await gh.setFiles({ "a.md": "one" });
+		await engine.pull();
+		await files.writeBinary("huge.bin", text("way past the four byte cap"));
+		const reads: string[] = [];
+		const origRead = files.readBinary.bind(files);
+		files.readBinary = async (path) => {
+			reads.push(path);
+			return origRead(path);
+		};
+		const push = await engine.push();
+		expect(push.skipped).toBe(1);
+		expect(reads).not.toContain("huge.bin");
+		reads.length = 0;
+		const plan = await engine.preview();
+		expect(plan.outgoing).toEqual([{ path: "huge.bin", action: "skip-oversize" }]);
+		expect(reads).not.toContain("huge.bin");
+	});
+
+	it("skips a file that disappears between listing and stat", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one" });
+		await engine.pull();
+		const origList = files.listRecursive.bind(files);
+		files.listRecursive = async (p) => [...(await origList(p)), "ghost.md"];
+		expect((await engine.push()).commit).toBe(null);
+		const plan = await engine.preview();
+		expect(plan.outgoing).toEqual([]);
+	});
+
+	it("preview ignores a touched-but-identical file", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one" });
+		await engine.pull();
+		await files.writeBinary("a.md", text("one"));
+		const plan = await engine.preview();
+		expect(plan.outgoing).toEqual([]);
+	});
+
+	it("preserves the remote file mode when pushing an edit", async () => {
+		const { gh, files, engine } = makeEngine();
+		gh.modes.set("run.sh", "100755");
+		await gh.setFiles({ "run.sh": "#!/bin/sh" });
+		await engine.pull();
+		await files.writeBinary("run.sh", text("#!/bin/sh\necho hi"));
+		await engine.push();
+		expect(gh.pushedTrees[0].entries[0]).toMatchObject({ path: "run.sh", mode: "100755" });
+	});
+});
+
+describe("placeholder drift", () => {
+	it("treats a stub whose mtime drifted as an untouched placeholder", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "big.pdf": new Uint8Array([1, 2, 3]) });
+		await engine.pull();
+		// A backup restore or file-provider touch rewrites the stub: still empty,
+		// but the fingerprint no longer matches.
+		await files.writeBinary("big.pdf", new ArrayBuffer(0));
+		expect(await engine.fetchLazy("big.pdf")).toBe("fetched");
+		expect((await files.stat("big.pdf"))?.size).toBe(3);
+	});
+});
+
+describe("overwrite safety under remote-wins", () => {
+	it("saves the local bytes before replacing a changed binary with a placeholder", async () => {
+		const { gh, files, engine } = makeEngine({ conflictPolicy: "remote-wins" });
+		await gh.setFiles({ "img.png": new Uint8Array([0, 1, 2]) });
+		await engine.pull();
+		await engine.fetchLazy("img.png");
+		const localBytes = new Uint8Array([7, 7, 7]);
+		await files.writeBinary("img.png", localBytes.buffer.slice(0) as ArrayBuffer);
+		await gh.setFiles({ "img.png": new Uint8Array([9, 9, 9]) });
+		await engine.pull();
+		expect((await files.stat("img.png"))?.size).toBe(0);
+		expect(new Uint8Array(await files.readBinary("_conflicts/img.png"))).toEqual(localBytes);
+	});
+
+	it("logs a warning when the remote version overwrites local changes", async () => {
+		const { gh, files, engine, logs } = makeEngine({ conflictPolicy: "remote-wins" });
+		await gh.setFiles({ "a.md": "base" });
+		await engine.pull();
+		await files.writeBinary("a.md", text("local edit"));
+		await gh.setFiles({ "a.md": "remote edit" });
+		await engine.pull();
+		expect(logs.some((l) => l.includes("overwriting local changes to a.md"))).toBe(true);
+	});
+});
+
+describe("oversize conflicts", () => {
+	it("records the conflict without downloading an oversize remote blob", async () => {
+		const { gh, files, engine, logs } = makeEngine({ maxAutoFetchBytes: 4 });
+		await gh.setFiles({ "a.md": "base" });
+		await engine.pull();
+		await files.writeBinary("a.md", text("local edit"));
+		await gh.setFiles({ "a.md": "remote edit!" });
+		const summary = await engine.pull();
+		expect(summary.conflicts).toBe(1);
+		expect(gh.blobFetches).not.toContain(await gitSha("remote edit!"));
+		expect(await files.stat("_conflicts/a.md")).toBeNull();
+		expect(files.readText("a.md")).toBe("local edit");
+		expect(logs.some((l) => l.includes("too large"))).toBe(true);
+	});
+});
+
+describe("preview parity with sync", () => {
+	it("labels a locally deleted, remotely changed file as deleted-conflict", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "base" });
+		await engine.pull();
+		await files.remove("a.md");
+		await gh.setFiles({ "a.md": "remote edit" });
+		const plan = await engine.preview();
+		expect(plan.incoming).toEqual([{ path: "a.md", action: "deleted-conflict" }]);
+	});
+
+	it("shows a restore row for a deleted placeholder instead of hiding it", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "big.pdf": new Uint8Array([1, 2, 3]) });
+		await engine.pull();
+		await files.remove("big.pdf");
+		const plan = await engine.preview();
+		expect(plan.outgoing).toEqual([{ path: "big.pdf", action: "restore-placeholder" }]);
+	});
+
+	it("classifies an untracked empty file matching an empty remote blob as adopt", async () => {
+		const { gh, files, engine } = makeEngine();
+		await files.writeBinary("empty.md", new ArrayBuffer(0));
+		await gh.setFiles({ "empty.md": "" });
+		const plan = await engine.preview();
+		expect(plan.incoming).toEqual([{ path: "empty.md", action: "adopt" }]);
+		expect(plan.outgoing).toEqual([]);
+	});
+});
+
 describe("config dir and exclusions", () => {
 	it("excludes prefixes case-insensitively", async () => {
 		const { gh, files, engine } = makeEngine();

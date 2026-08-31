@@ -6,6 +6,7 @@ export interface FileEntry {
 	mtime: number;
 	lazy?: true;
 	remoteSize?: number; // set on lazy entries: the real file's size on GitHub
+	mode?: string; // git mode when not the default "100644" (e.g. "100755")
 }
 
 export interface SyncState {
