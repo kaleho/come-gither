@@ -6,7 +6,13 @@ import { FakeGitHub, MemFiles, gitSha } from "./fakes";
 const STATE_PATH = ".obsidian/plugins/come-gither/sync-state.json";
 
 function makeEngine(
-	overrides: { maxAutoFetchBytes?: number; maxPushBytes?: number; conflictPolicy?: "merge" | "remote-wins" } = {},
+	overrides: {
+		maxAutoFetchBytes?: number;
+		maxPushBytes?: number;
+		conflictPolicy?: "merge" | "remote-wins";
+		configDir?: string;
+		excludedPrefixes?: string[];
+	} = {},
 ) {
 	const gh = new FakeGitHub();
 	const files = new MemFiles();
@@ -18,6 +24,13 @@ function makeEngine(
 		maxAutoFetchBytes: overrides.maxAutoFetchBytes ?? 100 * 1048576,
 		maxPushBytes: overrides.maxPushBytes ?? 30 * 1048576,
 		conflictPolicy: overrides.conflictPolicy ?? "merge",
+		configDir: overrides.configDir ?? ".obsidian",
+		excludedPrefixes: overrides.excludedPrefixes ?? [
+			"_conflicts/",
+			".obsidian/plugins/come-gither/",
+			".git/",
+			".trash/",
+		],
 	});
 	return { gh, files, state, engine, logs };
 }
@@ -470,6 +483,8 @@ describe("state persistence across engine instances", () => {
 			maxAutoFetchBytes: 100 * 1048576,
 			maxPushBytes: 30 * 1048576,
 			conflictPolicy: "merge",
+			configDir: ".obsidian",
+			excludedPrefixes: ["_conflicts/", ".obsidian/plugins/come-gither/", ".git/", ".trash/"],
 		});
 		return { state, engine };
 	}
@@ -726,6 +741,58 @@ describe("revert", () => {
 		await gh.setFiles({ "a.md": "base" });
 		await engine.pull();
 		expect(await engine.revert("a.md")).toBe("clean");
+	});
+});
+
+describe("config dir and exclusions", () => {
+	it("excludes prefixes case-insensitively", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ ".obsidian/plugins/Come-Gither/data.json": "{evil}", "ok.md": "y" });
+		const summary = await engine.pull();
+		expect(summary.fetched).toBe(1);
+		expect(await files.stat(".obsidian/plugins/Come-Gither/data.json")).toBeNull();
+	});
+
+	it("honors a custom config dir for exclusion and the remote-wins pin", async () => {
+		const { gh, files, engine } = makeEngine({
+			configDir: ".obsidian-work",
+			excludedPrefixes: ["_conflicts/", ".obsidian-work/plugins/come-gither/"],
+		});
+		await gh.setFiles({
+			".obsidian-work/plugins/come-gither/data.json": "{token}",
+			".obsidian-work/app.json": "{}",
+		});
+		await engine.pull();
+		expect(await files.stat(".obsidian-work/plugins/come-gither/data.json")).toBeNull();
+		await files.writeBinary(".obsidian-work/app.json", text("{local}"));
+		await gh.setFiles({
+			".obsidian-work/plugins/come-gither/data.json": "{token}",
+			".obsidian-work/app.json": "{remote}",
+		});
+		const summary = await engine.pull();
+		expect(summary.conflicts).toBe(0);
+		expect(files.readText(".obsidian-work/app.json")).toBe("{remote}");
+	});
+
+	it("fetches binaries under a custom config dir fully", async () => {
+		const { gh, files, engine } = makeEngine({
+			configDir: ".obsidian-work",
+			excludedPrefixes: ["_conflicts/"],
+		});
+		await gh.setFiles({ ".obsidian-work/plugins/x/icon.png": new Uint8Array([9, 9]) });
+		const summary = await engine.pull();
+		expect(summary.placeholders).toBe(0);
+		expect((await files.stat(".obsidian-work/plugins/x/icon.png"))?.size).toBe(2);
+	});
+
+	it("never pushes .git/ or .trash/ from a desktop checkout vault", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one" });
+		await engine.pull();
+		await files.writeBinary(".git/config", text("[remote]"));
+		await files.writeBinary(".trash/old.md", text("bye"));
+		const summary = await engine.push();
+		expect(summary.commit).toBe(null);
 	});
 });
 

@@ -42,7 +42,6 @@ const DEFAULT_SETTINGS: ComeGitherSettings = {
 	pullOnStart: true,
 };
 
-const PLUGIN_DIR = ".obsidian/plugins/come-gither";
 const MAX_PUSH_BYTES = 30 * 1048576;
 
 class ObsidianHttp implements Http {
@@ -275,10 +274,16 @@ export default class ComeGitherPlugin extends Plugin {
 	// events for them are ignored so modals never stack.
 	private busyPaths = new Set<string>();
 
+	// Never hardcode ".obsidian": users can override the vault's config folder,
+	// and with a custom folder a hardcoded path would leave the plugin's own
+	// data.json (which holds the token) unexcluded from sync.
+	private pluginDir!: string;
+
 	async onload(): Promise<void> {
 		this.settings = { ...DEFAULT_SETTINGS, ...((await this.loadData()) ?? {}) };
+		this.pluginDir = this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
 		this.vaultFiles = new AdapterFiles(this.app);
-		this.logger = new RingLogger(this.vaultFiles, `${PLUGIN_DIR}/log.txt`);
+		this.logger = new RingLogger(this.vaultFiles, `${this.pluginDir}/log.txt`);
 		this.statusEl = this.addStatusBarItem();
 		this.setStatus("idle");
 
@@ -359,7 +364,7 @@ export default class ComeGitherPlugin extends Plugin {
 				repo: this.settings.repo,
 				token: this.settings.token,
 			});
-			const state = new StateStore(this.vaultFiles, `${PLUGIN_DIR}/sync-state.json`);
+			const state = new StateStore(this.vaultFiles, `${this.pluginDir}/sync-state.json`);
 			await state.load();
 			const engine = new SyncEngine(client, this.vaultFiles, state, this.logger.log, {
 				branch: this.settings.branch,
@@ -367,6 +372,8 @@ export default class ComeGitherPlugin extends Plugin {
 				maxAutoFetchBytes: this.settings.maxAutoFetchMB * 1048576,
 				maxPushBytes: MAX_PUSH_BYTES,
 				conflictPolicy: this.settings.conflictPolicy,
+				configDir: this.app.vault.configDir,
+				excludedPrefixes: ["_conflicts/", `${this.pluginDir}/`, ".git/", ".trash/"],
 			});
 			this.session = { engine, state };
 		}

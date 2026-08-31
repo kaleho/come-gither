@@ -23,13 +23,15 @@ export interface SyncConfig {
 	maxAutoFetchBytes: number;
 	maxPushBytes: number;
 	conflictPolicy: "merge" | "remote-wins";
+	/** The vault's config folder (usually ".obsidian"; users can override it). */
+	configDir: string;
+	/** Path prefixes never synced in either direction, matched case-insensitively. */
+	excludedPrefixes: string[];
 }
 
 export const DEFAULT_TEXT_EXTENSIONS = [
 	"md", "txt", "json", "css", "js", "html", "csv", "canvas", "svg", "sh", "yml", "yaml",
 ];
-
-export const EXCLUDED_PREFIXES = ["_conflicts/", ".obsidian/plugins/come-gither/"];
 
 export interface PullSummary {
 	upToDate: boolean;
@@ -189,7 +191,7 @@ export class SyncEngine {
 				const staleStub = !entry && localSha === EMPTY_BLOB_SHA;
 				if (localSha === "clean" || staleStub) action = this.isLazyTarget(path, blob.size) ? "placeholder" : "fetch";
 				else if (localSha === blob.sha) action = "adopt";
-				else if (path.startsWith(".obsidian/") || this.config.conflictPolicy === "remote-wins") action = "overwrite";
+				else if (this.inConfigDir(path) || this.config.conflictPolicy === "remote-wins") action = "overwrite";
 				else action = "both-changed";
 				plan.incoming.push({ path, action });
 			}
@@ -385,7 +387,7 @@ export class SyncEngine {
 			}
 			// A stale zero-byte stub with no tracking has no user data to protect.
 			const staleStub = !entry && localSha === EMPTY_BLOB_SHA;
-			if (!staleStub && !path.startsWith(".obsidian/") && this.config.conflictPolicy === "merge") {
+			if (!staleStub && !this.inConfigDir(path) && this.config.conflictPolicy === "merge") {
 				await this.resolveConflict(path, blob, entry, localSha, summary);
 				return;
 			}
@@ -509,11 +511,18 @@ export class SyncEngine {
 	}
 
 	private isLazyTarget(path: string, size: number): boolean {
-		return size > this.config.maxAutoFetchBytes || (!this.isText(path) && !path.startsWith(".obsidian/"));
+		return size > this.config.maxAutoFetchBytes || (!this.isText(path) && !this.inConfigDir(path));
+	}
+
+	private inConfigDir(path: string): boolean {
+		return path.startsWith(`${this.config.configDir}/`);
 	}
 
 	private excluded(path: string): boolean {
-		return EXCLUDED_PREFIXES.some((p) => path.startsWith(p));
+		// Case-insensitive: on the case-insensitive filesystems Obsidian runs on,
+		// a differently-cased remote path resolves to the same local file.
+		const lower = path.toLowerCase();
+		return this.config.excludedPrefixes.some((p) => lower.startsWith(p.toLowerCase()));
 	}
 
 	private isText(path: string): boolean {
