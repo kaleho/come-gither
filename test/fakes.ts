@@ -191,7 +191,10 @@ export class FakeGitHub {
 	onCreateBlob?: () => Promise<void> | void;
 	private pushCounter = 0;
 
+	createBlobCalls = 0;
+
 	async createBlob(data: ArrayBuffer): Promise<string> {
+		this.createBlobCalls += 1;
 		if (this.onCreateBlob) await this.onCreateBlob();
 		const bytes = new Uint8Array(data);
 		const sha = await gitSha(bytes);

@@ -108,6 +108,11 @@ export class SyncEngine {
 	// of interleaving (an evict racing a push once truncated a file on GitHub).
 	private chain: Promise<unknown> = Promise.resolve();
 
+	// Content sha -> uploaded blob sha, within one sync or push call. Blobs are
+	// content-addressed and persist server-side, so a not-fast-forward retry
+	// reuses them instead of re-uploading at one throttled request per second.
+	private uploadedBlobs = new Map<string, string>();
+
 	private locked<T>(fn: () => Promise<T>): Promise<T> {
 		const prev = this.chain;
 		const run = (async () => {
@@ -135,10 +140,12 @@ export class SyncEngine {
 	}
 
 	push(): Promise<PushSummary> {
+		this.uploadedBlobs.clear();
 		return this.locked(() => this.doPush());
 	}
 
 	sync(): Promise<{ pull: PullSummary; push: PushSummary }> {
+		this.uploadedBlobs.clear();
 		return this.locked(() => this.doSync());
 	}
 
@@ -293,7 +300,11 @@ export class SyncEngine {
 				this.log("info", `${path} is an untracked empty stub; leaving it for the next pull`);
 				continue;
 			}
-			const sha = await this.gh.createBlob(await this.files.readBinary(path));
+			let sha = this.uploadedBlobs.get(localSha);
+			if (sha === undefined) {
+				sha = await this.gh.createBlob(await this.files.readBinary(path));
+				this.uploadedBlobs.set(localSha, sha);
+			}
 			treeEntries.push({ path, mode: entry?.mode ?? "100644", type: "blob", sha });
 			// The fingerprint from before the read: an edit made during the slow
 			// push window then surfaces as a change on the next sync instead of
