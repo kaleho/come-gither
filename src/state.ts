@@ -48,6 +48,9 @@ export class StateStore {
 		}
 		try {
 			const raw = new TextDecoder().decode(await this.files.readBinary(this.path));
+			// A successful read proves the file exists even when stat failed; the
+			// identity guard below must never be skipped for a readable file.
+			exists = true;
 			const parsed = JSON.parse(raw);
 			// Corrupt, future-versioned, or misshapen state is never trusted:
 			// fall back to a re-baseline (slow, never destructive).
