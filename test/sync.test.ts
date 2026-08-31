@@ -729,6 +729,66 @@ describe("revert", () => {
 	});
 });
 
+describe("operation serialization", () => {
+	it("queues an evict behind a running sync instead of racing it", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one", "big.pdf": new Uint8Array([1, 2, 3]) });
+		await engine.pull();
+		await engine.fetchLazy("big.pdf");
+		await files.writeBinary("a.md", text("edited"));
+		let release!: () => void;
+		const gate = new Promise<void>((r) => (release = r));
+		gh.onCreateBlob = () => gate; // the sync's push now blocks inside createBlob
+		const syncing = engine.sync();
+		const evicting = engine.evict("big.pdf");
+		await new Promise((r) => setTimeout(r, 0));
+		// The evict must not have touched the file while the sync holds the lock.
+		expect((await files.stat("big.pdf"))?.size).toBe(3);
+		gh.onCreateBlob = undefined;
+		release();
+		await syncing;
+		expect(await evicting).toBe("evicted");
+		// The push carried the real edit; no empty blob was ever uploaded for big.pdf.
+		expect(gh.createdBlobs.has(await gitSha("edited"))).toBe(true);
+		expect(gh.createdBlobs.has(await gitSha(new Uint8Array(0)))).toBe(false);
+		expect((await files.stat("big.pdf"))?.size).toBe(0);
+	});
+
+	it("runs a queued operation even when the one before it failed", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one" });
+		await engine.pull();
+		await files.writeBinary("new.md", text("fresh"));
+		gh.failUpdateRefTimes = 99;
+		const failing = engine.sync().catch((e) => e);
+		const reverting = engine.revert("new.md");
+		expect((await failing).kind).toBe("not-fast-forward");
+		expect(await reverting).toBe("reverted");
+		expect(await files.stat("new.md")).toBeNull();
+	});
+});
+
+describe("evict crash safety", () => {
+	it("persists the lazy entry before truncating the file", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "big.pdf": new Uint8Array([1, 2, 3]) });
+		await engine.pull();
+		await engine.fetchLazy("big.pdf");
+		let stateAtTruncate: string | null = null;
+		const origWrite = files.writeBinary.bind(files);
+		files.writeBinary = async (path, data) => {
+			if (path === "big.pdf" && data.byteLength === 0) stateAtTruncate = files.readText(STATE_PATH);
+			await origWrite(path, data);
+		};
+		expect(await engine.evict("big.pdf")).toBe("evicted");
+		expect(stateAtTruncate).not.toBeNull();
+		// A crash right after the truncation must leave a lazy entry on disk,
+		// so the next push skips the stub instead of uploading empty content.
+		const persisted = JSON.parse(stateAtTruncate ?? "{}");
+		expect(persisted.files["big.pdf"].lazy).toBe(true);
+	});
+});
+
 describe("stale empty stubs", () => {
 	it("treats an untracked zero-byte file as absent, not a conflict", async () => {
 		const { gh, files, state, engine } = makeEngine();

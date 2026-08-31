@@ -185,9 +185,12 @@ export class FakeGitHub {
 	pushedTrees: { baseTree: string; entries: { path: string; mode: string; type: string; sha: string | null }[] }[] = [];
 	pushedCommits = new Map<string, { parents: string[]; message: string }>();
 	failUpdateRefTimes = 0;
+	/** Test hook: awaited at the top of createBlob, so a test can hold a push mid-flight. */
+	onCreateBlob?: () => Promise<void> | void;
 	private pushCounter = 0;
 
 	async createBlob(data: ArrayBuffer): Promise<string> {
+		if (this.onCreateBlob) await this.onCreateBlob();
 		const bytes = new Uint8Array(data);
 		const sha = await gitSha(bytes);
 		this.createdBlobs.set(sha, bytes);

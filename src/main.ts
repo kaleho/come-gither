@@ -120,11 +120,14 @@ class AdapterFiles implements Files {
 }
 
 class ConfirmFetchModal extends Modal {
+	private confirmed = false;
+
 	constructor(
 		app: App,
 		private path: string,
 		private sizeBytes: number,
 		private onConfirm: () => void,
+		private onDone: (confirmed: boolean) => void,
 	) {
 		super(app);
 	}
@@ -138,6 +141,7 @@ class ConfirmFetchModal extends Modal {
 		new Setting(this.contentEl)
 			.addButton((b) =>
 				b.setButtonText("Download").setCta().onClick(() => {
+					this.confirmed = true;
 					this.close();
 					this.onConfirm();
 				}),
@@ -147,6 +151,7 @@ class ConfirmFetchModal extends Modal {
 
 	onClose(): void {
 		this.contentEl.empty();
+		this.onDone(this.confirmed);
 	}
 }
 
@@ -262,6 +267,13 @@ export default class ComeGitherPlugin extends Plugin {
 	private syncing = false;
 	private lazySizes = new Map<string, number>();
 	private intervalId: number | null = null;
+	// One engine + one StateStore for the whole plugin: every entry point shares
+	// them, and the engine's internal lock serializes the operations. Two stores
+	// over the same sync-state.json would clobber each other's flushes.
+	private session: { engine: SyncEngine; state: StateStore } | null = null;
+	// Paths with an open download prompt or a download in flight; file-open
+	// events for them are ignored so modals never stack.
+	private busyPaths = new Set<string>();
 
 	async onload(): Promise<void> {
 		this.settings = { ...DEFAULT_SETTINGS, ...((await this.loadData()) ?? {}) };
@@ -319,6 +331,7 @@ export default class ComeGitherPlugin extends Plugin {
 
 	async saveSettings(): Promise<void> {
 		await this.saveData(this.settings);
+		this.session = null; // the engine's client config may have changed
 		this.applyAutoSyncInterval();
 	}
 
@@ -339,21 +352,25 @@ export default class ComeGitherPlugin extends Plugin {
 		return Boolean(owner && repo && branch && token);
 	}
 
-	private async makeEngine(): Promise<SyncEngine> {
-		const client = new GitHubClient(new ObsidianHttp(), {
-			owner: this.settings.owner,
-			repo: this.settings.repo,
-			token: this.settings.token,
-		});
-		const state = new StateStore(this.vaultFiles, `${PLUGIN_DIR}/sync-state.json`);
-		await state.load();
-		return new SyncEngine(client, this.vaultFiles, state, this.logger.log, {
-			branch: this.settings.branch,
-			textExtensions: DEFAULT_TEXT_EXTENSIONS,
-			maxAutoFetchBytes: this.settings.maxAutoFetchMB * 1048576,
-			maxPushBytes: MAX_PUSH_BYTES,
-			conflictPolicy: this.settings.conflictPolicy,
-		});
+	private async getEngine(): Promise<SyncEngine> {
+		if (!this.session) {
+			const client = new GitHubClient(new ObsidianHttp(), {
+				owner: this.settings.owner,
+				repo: this.settings.repo,
+				token: this.settings.token,
+			});
+			const state = new StateStore(this.vaultFiles, `${PLUGIN_DIR}/sync-state.json`);
+			await state.load();
+			const engine = new SyncEngine(client, this.vaultFiles, state, this.logger.log, {
+				branch: this.settings.branch,
+				textExtensions: DEFAULT_TEXT_EXTENSIONS,
+				maxAutoFetchBytes: this.settings.maxAutoFetchMB * 1048576,
+				maxPushBytes: MAX_PUSH_BYTES,
+				conflictPolicy: this.settings.conflictPolicy,
+			});
+			this.session = { engine, state };
+		}
+		return this.session.engine;
 	}
 
 	async openPreview(): Promise<void> {
@@ -367,13 +384,13 @@ export default class ComeGitherPlugin extends Plugin {
 	}
 
 	async previewPlan(): Promise<SyncPlan> {
-		const engine = await this.makeEngine();
+		const engine = await this.getEngine();
 		return engine.preview();
 	}
 
 	async revertPath(path: string): Promise<void> {
 		try {
-			const engine = await this.makeEngine();
+			const engine = await this.getEngine();
 			const result = await engine.revert(path);
 			new Notice(
 				result === "reverted"
@@ -399,7 +416,7 @@ export default class ComeGitherPlugin extends Plugin {
 		this.syncing = true;
 		this.setStatus("syncing…");
 		try {
-			const engine = await this.makeEngine();
+			const engine = await this.getEngine();
 			const { pull, push } = await engine.sync();
 			await this.refreshLazyIndex();
 			const parts: string[] = [];
@@ -426,8 +443,8 @@ export default class ComeGitherPlugin extends Plugin {
 	}
 
 	private async refreshLazyIndex(): Promise<void> {
-		const state = new StateStore(this.vaultFiles, `${PLUGIN_DIR}/sync-state.json`);
-		await state.load();
+		await this.getEngine();
+		const state = (this.session as { state: StateStore }).state;
 		this.lazySizes.clear();
 		for (const [path, entry] of Object.entries(state.state.files)) {
 			if (entry.lazy) this.lazySizes.set(path, entry.remoteSize ?? 0);
@@ -450,20 +467,31 @@ export default class ComeGitherPlugin extends Plugin {
 			this.logger.log("info", `opened placeholder ${file.path} during a sync; ignoring`);
 			return;
 		}
+		if (this.busyPaths.has(file.path)) return; // a prompt is open or a download runs
 		this.logger.log("info", `opened placeholder ${file.path} (mode: ${this.settings.lazyFetchMode})`);
 		const leaf = this.app.workspace.getMostRecentLeaf();
 		if (this.settings.lazyFetchMode === "auto") {
 			await this.downloadAndOpen(file.path, leaf ?? undefined);
 			return;
 		}
-		new ConfirmFetchModal(this.app, file.path, this.lazySizes.get(file.path) as number, () =>
-			void this.downloadAndOpen(file.path, leaf ?? undefined),
+		this.busyPaths.add(file.path);
+		new ConfirmFetchModal(
+			this.app,
+			file.path,
+			this.lazySizes.get(file.path) as number,
+			() => void this.downloadAndOpen(file.path, leaf ?? undefined),
+			(confirmed) => {
+				// A dismissed prompt frees the path; a confirmed one stays busy
+				// until the download settles in downloadAndOpen's finally.
+				if (!confirmed) this.busyPaths.delete(file.path);
+			},
 		).open();
 	}
 
 	async downloadAndOpen(path: string, leaf?: WorkspaceLeaf): Promise<void> {
+		this.busyPaths.add(path);
 		try {
-			const engine = await this.makeEngine();
+			const engine = await this.getEngine();
 			const result = await engine.fetchLazy(path);
 			if (result === "fetched") {
 				this.lazySizes.delete(path);
@@ -472,18 +500,23 @@ export default class ComeGitherPlugin extends Plugin {
 				else new Notice(`Come Gither: downloaded ${path}.`);
 			} else if (result === "modified") {
 				new Notice(`Come Gither: ${path} was changed locally; not overwriting it.`);
+			} else {
+				await this.refreshLazyIndex();
+				new Notice(`Come Gither: ${path} is already downloaded.`);
 			}
 		} catch (e) {
-			new Notice(`Come Gither: download failed — ${e instanceof Error ? e.message : String(e)}`);
-			throw e;
+			const message = e instanceof Error ? e.message : String(e);
+			this.logger.log("error", `download of ${path} failed: ${message}`);
+			new Notice(`Come Gither: download failed — ${message}`);
 		} finally {
+			this.busyPaths.delete(path);
 			await this.logger.flush();
 		}
 	}
 
 	private async evictFile(file: TFile): Promise<void> {
 		try {
-			const engine = await this.makeEngine();
+			const engine = await this.getEngine();
 			const result = await engine.evict(file.path);
 			if (result === "evicted") {
 				await this.refreshLazyIndex();
@@ -493,6 +526,10 @@ export default class ComeGitherPlugin extends Plugin {
 			} else {
 				new Notice(`Come Gither: ${file.name} is not a downloaded synced file.`);
 			}
+		} catch (e) {
+			const message = e instanceof Error ? e.message : String(e);
+			this.logger.log("error", `evict of ${file.path} failed: ${message}`);
+			new Notice(`Come Gither: could not remove the local copy — ${message}`);
 		} finally {
 			await this.logger.flush();
 		}

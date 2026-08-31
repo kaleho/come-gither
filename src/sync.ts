@@ -93,7 +93,50 @@ export class SyncEngine {
 		private config: SyncConfig,
 	) {}
 
-	async fetchLazy(path: string): Promise<"fetched" | "not-lazy" | "modified"> {
+	// One operation at a time: sync, evict, revert, and lazy fetches all read and
+	// write the same files and state, so concurrent entry points queue here instead
+	// of interleaving (an evict racing a push once truncated a file on GitHub).
+	private chain: Promise<unknown> = Promise.resolve();
+
+	private locked<T>(fn: () => Promise<T>): Promise<T> {
+		const prev = this.chain;
+		const run = (async () => {
+			await prev.catch(() => {});
+			return fn();
+		})();
+		this.chain = run.catch(() => {});
+		return run;
+	}
+
+	fetchLazy(path: string): Promise<"fetched" | "not-lazy" | "modified"> {
+		return this.locked(() => this.doFetchLazy(path));
+	}
+
+	evict(path: string): Promise<"evicted" | "not-evictable" | "modified"> {
+		return this.locked(() => this.doEvict(path));
+	}
+
+	preview(): Promise<SyncPlan> {
+		return this.locked(() => this.doPreview());
+	}
+
+	revert(path: string): Promise<"reverted" | "clean"> {
+		return this.locked(() => this.doRevert(path));
+	}
+
+	push(): Promise<PushSummary> {
+		return this.locked(() => this.doPush());
+	}
+
+	sync(): Promise<{ pull: PullSummary; push: PushSummary }> {
+		return this.locked(() => this.doSync());
+	}
+
+	pull(): Promise<PullSummary> {
+		return this.locked(() => this.doPull());
+	}
+
+	private async doFetchLazy(path: string): Promise<"fetched" | "not-lazy" | "modified"> {
 		const entry = this.state.state.files[path];
 		if (!entry?.lazy) return "not-lazy";
 		if ((await this.localShaIfChanged(path, entry)) !== "clean") {
@@ -109,7 +152,7 @@ export class SyncEngine {
 	}
 
 	/** Free device space: replace a clean downloaded file with a placeholder again. */
-	async evict(path: string): Promise<"evicted" | "not-evictable" | "modified"> {
+	private async doEvict(path: string): Promise<"evicted" | "not-evictable" | "modified"> {
 		const entry = this.state.state.files[path];
 		if (!entry || entry.lazy) return "not-evictable";
 		if ((await this.localShaIfChanged(path, entry)) !== "clean") {
@@ -117,6 +160,11 @@ export class SyncEngine {
 			return "modified";
 		}
 		const remoteSize = entry.size;
+		// Persist the lazy intent BEFORE truncating: a crash between the two steps
+		// leaves a lazy entry (push skips those), never an empty file that a later
+		// push could mistake for an edit and upload over the real remote content.
+		await this.state.setFile(path, { baseBlobSha: entry.baseBlobSha, size: 0, mtime: 0, lazy: true, remoteSize });
+		await this.state.flush();
 		await this.files.writeBinary(path, new ArrayBuffer(0));
 		await this.record(path, entry.baseBlobSha, true, remoteSize);
 		await this.state.flush();
@@ -125,7 +173,7 @@ export class SyncEngine {
 	}
 
 	/** Read-only classification of what the next sync would do. Fetches no blobs, writes nothing. */
-	async preview(): Promise<SyncPlan> {
+	private async doPreview(): Promise<SyncPlan> {
 		const plan: SyncPlan = { headMoved: false, incoming: [], outgoing: [] };
 		const head = await this.gh.getRef(this.config.branch);
 		if (head !== this.state.state.lastSyncedCommit) {
@@ -177,7 +225,7 @@ export class SyncEngine {
 	}
 
 	/** Discard a local change: restore the last-synced content (or stub), or delete a new file. */
-	async revert(path: string): Promise<"reverted" | "clean"> {
+	private async doRevert(path: string): Promise<"reverted" | "clean"> {
 		const entry = this.state.state.files[path];
 		if (!entry) {
 			if ((await this.files.stat(path)) === null) return "clean";
@@ -199,7 +247,7 @@ export class SyncEngine {
 		return "reverted";
 	}
 
-	async push(): Promise<PushSummary> {
+	private async doPush(): Promise<PushSummary> {
 		const summary: PushSummary = { pushed: 0, deletedRemote: 0, skipped: 0, commit: null };
 		const treeEntries: { path: string; mode: string; type: "blob"; sha: string | null }[] = [];
 		const localPaths = new Set(
@@ -270,20 +318,20 @@ export class SyncEngine {
 		return summary;
 	}
 
-	async sync(attempt = 1): Promise<{ pull: PullSummary; push: PushSummary }> {
-		const pull = await this.pull();
+	private async doSync(attempt = 1): Promise<{ pull: PullSummary; push: PushSummary }> {
+		const pull = await this.doPull();
 		try {
-			return { pull, push: await this.push() };
+			return { pull, push: await this.doPush() };
 		} catch (e) {
 			if (e instanceof GitHubError && e.kind === "not-fast-forward" && attempt < 3) {
 				this.log("warn", "the branch moved during the push; pulling again and retrying");
-				return this.sync(attempt + 1);
+				return this.doSync(attempt + 1);
 			}
 			throw e;
 		}
 	}
 
-	async pull(): Promise<PullSummary> {
+	private async doPull(): Promise<PullSummary> {
 		const summary: PullSummary = {
 			upToDate: false,
 			fetched: 0,
