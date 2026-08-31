@@ -1,6 +1,6 @@
 {
 	"name": "come-gither",
-	"version": "0.3.3",
+	"version": "0.4.0",
 	"description": "Obsidian plugin: sync a vault with a GitHub repository through the GitHub API",
 	"main": "main.js",
 	"scripts": {
