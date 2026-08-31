@@ -637,7 +637,15 @@ export default class ComeGitherPlugin extends Plugin {
 				// A retire mid-evict must not turn the finished evict into an
 				// error Notice; the next sync heals the entry either way.
 				const stat = await this.vaultFiles.stat(file.path);
-				if (stat && stat.size > 0) await engine.revert(file.path).catch(() => {});
+				if (stat && stat.size > 0) {
+					await engine.revert(file.path).catch((e) => {
+						const message = e instanceof Error ? e.message : String(e);
+						// A retire mid-command is expected; anything else is logged.
+						if (!message.includes("retired")) {
+							this.logger.log("error", `re-stub of ${file.path} after evict failed: ${message}`);
+						}
+					});
+				}
 				new Notice(`Come Gither: removed the local copy of ${file.name}. It stays on GitHub.`);
 			} else if (result === "modified") {
 				new Notice(`Come Gither: ${file.name} has unpushed changes. Sync first.`);

@@ -491,6 +491,36 @@ describe("case-only remote renames", () => {
 		expect(gh.createBlobCalls).toBe(0);
 	});
 
+	it("emits a genuine delete when two distinct tracked case twins exist", async () => {
+		// Case-sensitive filesystem: note.md and Note.md are two real files.
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "note.md": "lower", "Note.md": "upper" });
+		await engine.pull();
+		await files.remove("note.md");
+		const plan = await engine.preview();
+		expect(plan.outgoing).toEqual([{ path: "note.md", action: "deleted" }]);
+		const push = await engine.push();
+		expect(push.deletedRemote).toBe(1);
+		expect(gh.filesByPath.has("note.md")).toBe(false);
+		expect(gh.filesByPath.has("Note.md")).toBe(true);
+	});
+
+	it("preview matches pull for a remote case rename on a case-sensitive filesystem", async () => {
+		const { gh, engine } = makeEngine();
+		await gh.setFiles({ "note.md": "content" });
+		await engine.pull();
+		await gh.setFiles({ "Note.md": "content" });
+		const plan = await engine.preview();
+		// Pull will fetch Note.md as a second file and delete note.md; the
+		// panel must say so instead of hiding the delete.
+		expect(plan.incoming).toEqual(
+			expect.arrayContaining([
+				{ path: "Note.md", action: "fetch" },
+				{ path: "note.md", action: "delete" },
+			]),
+		);
+	});
+
 	it("propagates a case rename with edits and logs the collision risk", async () => {
 		const files = new CaseFoldMemFiles();
 		const { gh, engine, logs } = makeEngine({ files });
