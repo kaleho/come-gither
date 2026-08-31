@@ -40,6 +40,42 @@ describe("RingLogger", () => {
 		expect(files.readText(PATH)).toBe("1970-01-01T00:00:00.000Z error boom");
 	});
 
+	it("seeds the ring from the previous session's file", async () => {
+		const files = new MemFiles();
+		files.writeText(PATH, "old line 1\nold line 2");
+		const logger = new RingLogger(files, PATH, { now: () => 0 });
+		logger.log("info", "early");
+		await logger.init();
+		logger.log("info", "later");
+		expect(logger.dump().split("\n")).toEqual([
+			"old line 1",
+			"old line 2",
+			"--- session start ---",
+			"1970-01-01T00:00:00.000Z info early",
+			"1970-01-01T00:00:00.000Z info later",
+		]);
+		// The next flush keeps the history instead of erasing the crash evidence.
+		await logger.flush();
+		expect(files.readText(PATH)).toContain("old line 1");
+	});
+
+	it("caps the seeded history at capacity", async () => {
+		const files = new MemFiles();
+		files.writeText(PATH, Array.from({ length: 10 }, (_, i) => `o${i}`).join("\n"));
+		const logger = new RingLogger(files, PATH, { capacity: 4, now: () => 0 });
+		await logger.init();
+		const lines = logger.dump().split("\n");
+		expect(lines).toEqual(["o7", "o8", "o9", "--- session start ---"]);
+	});
+
+	it("init tolerates a missing previous log", async () => {
+		const logger = new RingLogger(new MemFiles(), PATH, { now: () => 0 });
+		await logger.init();
+		logger.log("info", "x");
+		expect(logger.dump()).toContain("info x");
+		expect(logger.dump()).not.toContain("session start");
+	});
+
 	it("uses the real clock when none is injected", async () => {
 		const files = new MemFiles();
 		const logger = new RingLogger(files, PATH);

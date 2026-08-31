@@ -47,6 +47,7 @@ export interface PushSummary {
 	pushed: number;
 	deletedRemote: number;
 	skipped: number;
+	skippedPaths: string[];
 	commit: string | null;
 }
 
@@ -269,7 +270,7 @@ export class SyncEngine {
 	}
 
 	private async doPush(): Promise<PushSummary> {
-		const summary: PushSummary = { pushed: 0, deletedRemote: 0, skipped: 0, commit: null };
+		const summary: PushSummary = { pushed: 0, deletedRemote: 0, skipped: 0, skippedPaths: [], commit: null };
 		const treeEntries: { path: string; mode: string; type: "blob"; sha: string | null }[] = [];
 		const fingerprints = new Map<string, { mtime: number; size: number; mode?: string }>();
 		const localPaths = new Set(
@@ -284,6 +285,7 @@ export class SyncEngine {
 			if (stat.size > this.config.maxPushBytes) {
 				// Checked before hashing: never read a file the API cannot accept.
 				summary.skipped += 1;
+				summary.skippedPaths.push(path);
 				this.log("warn", `${path} is ${stat.size} bytes, over the push limit; push it from desktop git`);
 				continue;
 			}
@@ -291,6 +293,7 @@ export class SyncEngine {
 			if (localSha === "clean") continue;
 			if (entry?.lazy) {
 				summary.skipped += 1;
+				summary.skippedPaths.push(path);
 				this.log("warn", `${path} is an unfetched placeholder that was modified locally; not pushing it`);
 				continue;
 			}
