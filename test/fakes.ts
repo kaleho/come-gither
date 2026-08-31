@@ -109,7 +109,12 @@ interface RemoteFile {
 	bytes: Uint8Array;
 }
 
-/** In-memory GitHub remote: one head commit over a flat set of files. */
+/**
+ * In-memory GitHub remote. Mirrors the API semantics the engine depends on:
+ * trees are snapshot-addressed by sha, a pushed commit records its real tree,
+ * and create-tree rejects a null-sha delete for a path absent from the base
+ * tree, exactly as GitHub does.
+ */
 export class FakeGitHub {
 	head = "commit-0";
 	filesByPath = new Map<string, RemoteFile>();
@@ -118,13 +123,17 @@ export class FakeGitHub {
 	blobFetches: string[] = [];
 	treeFetches: string[] = [];
 	failNextBlobFetches = 0;
+	/** Fail the nth getBlobRaw call of the test (0-based), once. */
+	failBlobFetchAtIndex: number | null = null;
 	truncateRecursive = false;
 	private commitCounter = 0;
+	private blobFetchCount = 0;
 
 	private allBlobs = new Map<string, Uint8Array>();
+	private snapshots = new Map<string, Map<string, RemoteFile>>();
 
 	async setFiles(contents: Record<string, Uint8Array | string>): Promise<void> {
-		this.filesByPath.clear();
+		this.filesByPath = new Map();
 		for (const [path, data] of Object.entries(contents)) {
 			const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
 			const sha = await gitSha(bytes);
@@ -132,6 +141,7 @@ export class FakeGitHub {
 			this.allBlobs.set(sha, bytes); // git keeps every historical blob
 		}
 		this.head = `commit-${++this.commitCounter}`;
+		this.snapshots.set(`tree-of-${this.head}`, new Map(this.filesByPath));
 	}
 
 	async getRef(_branch: string): Promise<string> {
@@ -139,11 +149,24 @@ export class FakeGitHub {
 	}
 
 	async getCommit(sha: string): Promise<{ treeSha: string; parents: string[] }> {
+		const pushed = this.pushedCommits.get(sha);
+		if (pushed) return { treeSha: pushed.treeSha, parents: pushed.parents };
 		return { treeSha: `tree-of-${sha}`, parents: [] };
+	}
+
+	private resolveTree(sha: string): { map: Map<string, RemoteFile>; root: string; prefix: string } {
+		if (sha.startsWith("dir:")) {
+			const rest = sha.slice(4);
+			const cut = rest.indexOf(":");
+			const root = rest.slice(0, cut);
+			return { map: this.snapshots.get(root) ?? this.filesByPath, root, prefix: rest.slice(cut + 1) };
+		}
+		return { map: this.snapshots.get(sha) ?? this.filesByPath, root: sha, prefix: "" };
 	}
 
 	async getTree(sha: string, recursive: boolean) {
 		this.treeFetches.push(`${sha}:${recursive}`);
+		const { map, root, prefix } = this.resolveTree(sha);
 		const blob = (path: string, f: RemoteFile, fullPath = path) => ({
 			path,
 			mode: this.modes.get(fullPath) ?? "100644",
@@ -155,29 +178,28 @@ export class FakeGitHub {
 			if (this.truncateRecursive) return { entries: [], truncated: true };
 			// Real recursive listings include tree rows alongside blobs.
 			const dirs = new Set<string>();
-			for (const p of this.filesByPath.keys()) {
+			for (const p of map.keys()) {
 				const parts = p.split("/").slice(0, -1);
 				for (let i = 1; i <= parts.length; i++) dirs.add(parts.slice(0, i).join("/"));
 			}
 			return {
 				entries: [
-					...[...dirs].map((d) => ({ path: d, mode: "040000", type: "tree" as const, sha: `dir:${d}/` })),
-					...[...this.filesByPath.entries()].map(([p, f]) => blob(p, f)),
+					...[...dirs].map((d) => ({ path: d, mode: "040000", type: "tree" as const, sha: `dir:${root}:${d}/` })),
+					...[...map.entries()].map(([p, f]) => blob(p, f)),
 				],
 				truncated: false,
 			};
 		}
 		// Non-recursive: one level under the directory the tree sha names.
-		const prefix = sha.startsWith("dir:") ? sha.slice(4) : "";
 		const seen = new Map<string, ReturnType<typeof blob> | { path: string; mode: string; type: "tree"; sha: string; size?: number }>();
-		for (const [p, f] of this.filesByPath) {
+		for (const [p, f] of map) {
 			if (!p.startsWith(prefix)) continue;
 			const rest = p.slice(prefix.length);
 			const slash = rest.indexOf("/");
 			if (slash === -1) seen.set(rest, blob(rest, f, p));
 			else {
 				const dir = rest.slice(0, slash);
-				seen.set(dir, { path: dir, mode: "040000", type: "tree", sha: `dir:${prefix}${dir}/` });
+				seen.set(dir, { path: dir, mode: "040000", type: "tree", sha: `dir:${root}:${prefix}${dir}/` });
 			}
 		}
 		return { entries: [...seen.values()], truncated: false };
@@ -185,7 +207,7 @@ export class FakeGitHub {
 
 	createdBlobs = new Map<string, Uint8Array>();
 	pushedTrees: { baseTree: string; entries: { path: string; mode: string; type: string; sha: string | null }[] }[] = [];
-	pushedCommits = new Map<string, { parents: string[]; message: string }>();
+	pushedCommits = new Map<string, { parents: string[]; message: string; treeSha: string }>();
 	failUpdateRefTimes = 0;
 	/** Test hook: awaited at the top of createBlob, so a test can hold a push mid-flight. */
 	onCreateBlob?: () => Promise<void> | void;
@@ -199,6 +221,7 @@ export class FakeGitHub {
 		const bytes = new Uint8Array(data);
 		const sha = await gitSha(bytes);
 		this.createdBlobs.set(sha, bytes);
+		this.allBlobs.set(sha, bytes);
 		return sha;
 	}
 
@@ -206,13 +229,31 @@ export class FakeGitHub {
 		baseTree: string,
 		entries: { path: string; mode: string; type: "blob" | "tree"; sha: string | null }[],
 	): Promise<string> {
+		const base = this.snapshots.get(baseTree);
+		if (!base) throw new GitHubError(404, "not-found", `fake: unknown base tree ${baseTree}`);
+		const result = new Map(base);
+		for (const e of entries) {
+			if (e.sha === null) {
+				// GitHub 422s a delete for a path the base tree does not contain.
+				if (!base.has(e.path)) {
+					throw new GitHubError(422, "other", `fake: cannot delete ${e.path}: not in base tree`);
+				}
+				result.delete(e.path);
+				continue;
+			}
+			const bytes = this.allBlobs.get(e.sha);
+			if (!bytes) throw new GitHubError(404, "not-found", `fake: unknown blob ${e.sha}`);
+			result.set(e.path, { sha: e.sha, size: bytes.length, bytes });
+		}
+		const treeSha = `tree-push-${++this.pushCounter}`;
+		this.snapshots.set(treeSha, result);
 		this.pushedTrees.push({ baseTree, entries });
-		return `tree-push-${++this.pushCounter}`;
+		return treeSha;
 	}
 
-	async createCommit(message: string, _treeSha: string, parents: string[]): Promise<string> {
+	async createCommit(message: string, treeSha: string, parents: string[]): Promise<string> {
 		const sha = `commit-push-${this.pushCounter}`;
-		this.pushedCommits.set(sha, { parents, message });
+		this.pushedCommits.set(sha, { parents, message, treeSha });
 		return sha;
 	}
 
@@ -226,11 +267,18 @@ export class FakeGitHub {
 			throw new GitHubError(422, "not-fast-forward", "fake: not a fast forward");
 		}
 		this.head = sha;
+		// The remote now serves the pushed tree's content.
+		this.filesByPath = new Map(this.snapshots.get(commit.treeSha) as Map<string, RemoteFile>);
 	}
 
 	async getBlobRaw(sha: string): Promise<ArrayBuffer> {
+		const index = this.blobFetchCount++;
 		if (this.failNextBlobFetches > 0) {
 			this.failNextBlobFetches -= 1;
+			throw new Error("network dropped");
+		}
+		if (this.failBlobFetchAtIndex === index) {
+			this.failBlobFetchAtIndex = null;
 			throw new Error("network dropped");
 		}
 		this.blobFetches.push(sha);

@@ -201,22 +201,19 @@ describe("pull: resumability and truncation", () => {
 	it("resumes an interrupted pull without refetching applied files", async () => {
 		const { gh, state, engine } = makeEngine();
 		await gh.setFiles({ "a.md": "one", "b.md": "two", "c.md": "three" });
-		gh.failNextBlobFetches = 0;
-		// First attempt: let one blob fetch fail mid-pull.
-		gh.failNextBlobFetches = 0;
-		const firstShas = gh.blobFetches;
-		gh.failNextBlobFetches = 1;
-		// The first fetch fails, so at most the later files land.
+		// The first file lands, then the connection drops on the second fetch.
+		gh.failBlobFetchAtIndex = 1;
 		await expect(engine.pull()).rejects.toThrow("network dropped");
 		expect(state.state.lastSyncedCommit).toBeNull();
-		const applied = Object.keys(state.state.files).length;
-		expect(applied).toBeLessThan(3);
-		firstShas.length = 0;
+		expect(Object.keys(state.state.files)).toEqual(["a.md"]);
+		gh.blobFetches.length = 0;
 		const summary = await engine.pull();
 		expect(state.state.lastSyncedCommit).toBe(gh.head);
 		expect(Object.keys(state.state.files).length).toBe(3);
-		expect(summary.fetched).toBe(3 - applied);
-		expect(gh.blobFetches.length).toBe(3 - applied);
+		// Only the two files the interruption left behind are fetched again.
+		expect(summary.fetched).toBe(2);
+		expect(gh.blobFetches).not.toContain(await gitSha("one"));
+		expect(gh.blobFetches.length).toBe(2);
 	});
 
 	it("falls back to walking subtrees when the recursive listing truncates", async () => {
@@ -340,7 +337,66 @@ describe("push", () => {
 	});
 });
 
+describe("remote fidelity", () => {
+	it("pushes a commit whose tree builds on the synced base tree", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one" });
+		await engine.pull();
+		const base = gh.head;
+		await files.writeBinary("new.md", text("fresh"));
+		const push = await engine.push();
+		expect(gh.pushedTrees[0].baseTree).toBe(`tree-of-${base}`);
+		const commit = gh.pushedCommits.get(push.commit as string);
+		expect(commit?.treeSha).toBe("tree-push-1");
+		// The remote now serves the pushed content under the new head.
+		const { treeSha } = await gh.getCommit(gh.head);
+		const tree = await gh.getTree(treeSha, true);
+		expect(tree.entries.filter((e) => e.type === "blob").map((e) => e.path).sort()).toEqual(["a.md", "new.md"]);
+	});
+
+	it("FakeGitHub rejects deleting a path missing from the base tree, like GitHub", async () => {
+		const { gh } = makeEngine();
+		await gh.setFiles({ "a.md": "x" });
+		await expect(
+			gh.createTree(`tree-of-${gh.head}`, [{ path: "ghost.md", mode: "100644", type: "blob", sha: null }]),
+		).rejects.toThrow("not in base tree");
+	});
+
+	it("FakeGitHub serves historical trees by sha after the remote moves on", async () => {
+		const { gh } = makeEngine();
+		await gh.setFiles({ "a.md": "one" });
+		const oldTree = `tree-of-${gh.head}`;
+		await gh.setFiles({ "a.md": "one", "b.md": "two" });
+		const old = await gh.getTree(oldTree, true);
+		expect(old.entries.filter((e) => e.type === "blob").map((e) => e.path)).toEqual(["a.md"]);
+	});
+});
+
 describe("sync: fast-forward retry", () => {
+	it("integrates an interloper commit when the push retries", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one" });
+		await engine.pull();
+		await files.writeBinary("new.md", text("fresh"));
+		// The head moves while the push is uploading its blob: the first
+		// updateRef fails as a genuine not-fast-forward, not an injected error.
+		gh.onCreateBlob = async () => {
+			gh.onCreateBlob = undefined;
+			await gh.setFiles({ "a.md": "one", "interloper.md": "surprise" });
+		};
+		const { push } = await engine.sync();
+		expect(push.commit).not.toBe(null);
+		// The retry pulled the interloper's file and rebased onto the moved head.
+		expect(files.readText("interloper.md")).toBe("surprise");
+		const commit = gh.pushedCommits.get(push.commit as string);
+		expect(commit?.parents).not.toEqual([]);
+		expect(gh.head).toBe(push.commit);
+		const { treeSha } = await gh.getCommit(gh.head);
+		const tree = await gh.getTree(treeSha, true);
+		const paths = tree.entries.filter((e) => e.type === "blob").map((e) => e.path).sort();
+		expect(paths).toEqual(["a.md", "interloper.md", "new.md"]);
+	});
+
 	it("reuses blobs already uploaded when the push retries", async () => {
 		const { gh, files, engine } = makeEngine();
 		await gh.setFiles({ "a.md": "one" });
