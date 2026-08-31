@@ -13,7 +13,7 @@ Real git implementations struggle on mobile with large repositories. Come Gither
 - **Free up space.** The command *Remove local copy (keep on GitHub)* turns a downloaded file back into a placeholder.
 - **Conflict resolution.** When both sides change a text file, the plugin merges the edits when they do not overlap. When they overlap, it keeps your local file and saves the server version under `_conflicts/` for review. A "remote wins" mode takes the server version instead. `.obsidian/` always takes the server version.
 - **Preview before you sync.** The command *Preview sync* lists incoming and outgoing changes. Each outgoing change has a Revert button.
-- **Safe interruption.** A killed or backgrounded sync resumes where it stopped. Nothing appears on GitHub until the final commit lands.
+- **Safe interruption.** A killed or backgrounded pull resumes where it stopped. An interrupted upload restarts, but nothing appears on GitHub until the final commit lands.
 - **Log export.** The command *Export sync log* writes the sync log to a note, so you can share it from any device.
 
 ## Network use disclosure
@@ -37,7 +37,7 @@ The first sync of a large vault takes a while and is safe to interrupt. Start it
 
 - **Conflict policy** — merge (default) or remote wins.
 - **Placeholder downloads** — ask first (default) or download immediately.
-- **Largest automatic download (MB)** — files above this size stay placeholders until you open them.
+- **Largest automatic download (MB)** — text files above this size, and all binary files, stay placeholders until you open them.
 - **Automatic sync interval (minutes)** — 0 is off; otherwise 3 to 60.
 - **Pull when Obsidian starts** — on by default.
 
@@ -45,6 +45,7 @@ The first sync of a large vault takes a while and is safe to interrupt. Start it
 
 - Files over 30 MB cannot be uploaded through the GitHub API. The plugin skips them with a warning; push them with desktop git.
 - Git LFS is not supported.
+- Syncing `.obsidian/` includes the code and settings of your other plugins. Anyone with write access to your repository can change what those plugins run. Use a repository only you control.
 - A binary embedded in a note renders as broken until you open the file directly once.
 - Deletions sync both ways. Deleting a downloaded file locally deletes it on GitHub on the next sync. Deleting a placeholder does not; the placeholder returns.
 

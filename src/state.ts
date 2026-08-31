@@ -26,6 +26,8 @@ function empty(): SyncState {
 
 export class StateStore {
 	state: SyncState = empty();
+	/** True when the last load discarded an unusable or re-pointed state file. */
+	rebaselined = false;
 	private dirty = 0;
 	private lastFlushAt = 0;
 
@@ -37,14 +39,18 @@ export class StateStore {
 
 	async load(expectedRemote?: string): Promise<void> {
 		this.lastFlushAt = this.now();
+		this.rebaselined = false;
+		const exists = (await this.files.stat(this.path)) !== null;
 		try {
 			const raw = new TextDecoder().decode(await this.files.readBinary(this.path));
 			const parsed = JSON.parse(raw);
 			// Corrupt or future-versioned state is never trusted: fall back to a
 			// re-baseline (slow, never destructive) rather than guessing.
 			this.state = parsed.version === 1 ? parsed : empty();
+			this.rebaselined = parsed.version !== 1;
 		} catch {
 			this.state = empty();
+			this.rebaselined = exists; // a fresh vault has no file and is not a re-baseline
 		}
 		if (expectedRemote !== undefined) {
 			// Entries tracked against another repo or branch must never be
@@ -53,6 +59,7 @@ export class StateStore {
 			// no stamp predates the stamp; adopt it once.
 			if (this.state.remote !== undefined && this.state.remote !== expectedRemote) {
 				this.state = empty();
+				this.rebaselined = true;
 			}
 			this.state.remote = expectedRemote;
 		}

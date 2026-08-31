@@ -33,11 +33,13 @@ export interface GitHubClientOptions {
 	token: string;
 	sleep?: (ms: number) => Promise<void>;
 	now?: () => number;
+	log?: (level: "info" | "warn" | "error", message: string) => void;
 }
 
 const API = "https://api.github.com";
 const MAX_ATTEMPTS = 3;
 const WRITE_INTERVAL_MS = 1000;
+const MAX_RETRY_DELAY_MS = 60_000;
 
 function toBase64(data: ArrayBuffer): string {
 	const bytes = new Uint8Array(data);
@@ -121,6 +123,10 @@ export class GitHubClient {
 		await this.call("PATCH", `/git/refs/heads/${branch}`, { sha, force: false });
 	}
 
+	private logOpt(level: "info" | "warn" | "error", message: string): void {
+		this.opts.log?.(level, message);
+	}
+
 	private async call(
 		method: string,
 		path: string,
@@ -148,11 +154,21 @@ export class GitHubClient {
 			(res.status === 403 &&
 				(res.headers["retry-after"] !== undefined ||
 					res.headers["x-ratelimit-remaining"] === "0"));
-		if (rateLimited && attempt < MAX_ATTEMPTS) {
-			await this.sleep(this.retryDelayMs(res));
-			return this.call(method, path, body, extraHeaders, attempt + 1);
+		if (rateLimited) {
+			const delay = this.retryDelayMs(res);
+			// A long wait (the primary limit resets up to an hour out) must fail
+			// loudly with the wait time, never sleep in silence looking hung.
+			if (attempt < MAX_ATTEMPTS && delay <= MAX_RETRY_DELAY_MS) {
+				this.logOpt(
+					"warn",
+					`rate limited on ${path}; waiting ${Math.ceil(delay / 1000)}s (attempt ${attempt}/${MAX_ATTEMPTS})`,
+				);
+				await this.sleep(delay);
+				return this.call(method, path, body, extraHeaders, attempt + 1);
+			}
+			throw this.toError(res, path, true, delay);
 		}
-		throw this.toError(res, path, rateLimited);
+		throw this.toError(res, path, false);
 	}
 
 	private retryDelayMs(res: HttpResponse): number {
@@ -165,12 +181,15 @@ export class GitHubClient {
 		return 1000;
 	}
 
-	private toError(res: HttpResponse, path: string, rateLimited: boolean): GitHubError {
+	private toError(res: HttpResponse, path: string, rateLimited: boolean, delayMs?: number): GitHubError {
 		let message = `GitHub ${res.status} on ${path}`;
 		try {
 			message = `${message}: ${JSON.parse(res.text).message}`;
 		} catch {
 			// non-JSON error body; keep the generic message
+		}
+		if (rateLimited && delayMs !== undefined) {
+			message = `${message}; try again in ~${Math.ceil(delayMs / 1000)}s`;
 		}
 		let kind: GitHubErrorKind = "other";
 		if (rateLimited) kind = "rate-limited";

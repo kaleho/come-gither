@@ -169,6 +169,44 @@ describe("GitHubClient errors", () => {
 		expect(http.requests.length).toBe(3);
 	});
 
+	it("gives up at once when the required wait exceeds the cap, naming the wait", async () => {
+		const http = new FakeHttp();
+		const clock = new FakeClock();
+		http.on(
+			"GET",
+			"/git/ref/",
+			jsonResponse({ message: "rate limited" }, 403, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": "3600" }),
+		);
+		const err = await makeClient(http, clock).getRef("master").catch((e) => e);
+		expect(err.kind).toBe("rate-limited");
+		expect(clock.sleeps).toEqual([]);
+		expect(http.requests.length).toBe(1);
+		expect(err.message).toContain("try again in ~3600s");
+	});
+
+	it("logs each rate-limit wait with the attempt number", async () => {
+		const http = new FakeHttp();
+		const clock = new FakeClock();
+		const logs: string[] = [];
+		http.on(
+			"GET",
+			"/git/ref/",
+			jsonResponse({ message: "rate limited" }, 403, { "retry-after": "2", "x-ratelimit-remaining": "0" }),
+			1,
+		);
+		http.on("GET", "/git/ref/", jsonResponse({ object: { sha: "abc" } }));
+		const client = new GitHubClient(http, {
+			owner: "kaleho",
+			repo: "vault",
+			token: "tok123",
+			sleep: clock.sleep,
+			now: clock.now,
+			log: (_level, message) => logs.push(message),
+		});
+		await client.getRef("master");
+		expect(logs.some((m) => m.includes("waiting 2s") && m.includes("attempt 1/3"))).toBe(true);
+	});
+
 	it("maps plain 403 without rate-limit headers to auth", async () => {
 		const http = new FakeHttp();
 		http.on("GET", "/git/ref/", jsonResponse({ message: "Forbidden" }, 403));

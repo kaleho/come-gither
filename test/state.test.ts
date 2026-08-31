@@ -78,6 +78,37 @@ describe("StateStore remote identity", () => {
 	});
 });
 
+describe("StateStore rebaselined flag", () => {
+	it("is false for a fresh vault and a valid same-remote file", async () => {
+		const { store } = makeStore();
+		await store.load();
+		expect(store.rebaselined).toBe(false);
+		const files = new MemFiles();
+		files.writeText(PATH, JSON.stringify({ version: 1, lastSyncedCommit: "c", files: {}, remote: "a/b#c" }));
+		const same = new StateStore(files, PATH);
+		await same.load("a/b#c");
+		expect(same.rebaselined).toBe(false);
+	});
+
+	it("is true for corrupt, future-versioned, and re-pointed state", async () => {
+		const corrupt = new MemFiles();
+		corrupt.writeText(PATH, "{not json");
+		const a = new StateStore(corrupt, PATH);
+		await a.load();
+		expect(a.rebaselined).toBe(true);
+		const future = new MemFiles();
+		future.writeText(PATH, JSON.stringify({ version: 99, files: {} }));
+		const b = new StateStore(future, PATH);
+		await b.load();
+		expect(b.rebaselined).toBe(true);
+		const moved = new MemFiles();
+		moved.writeText(PATH, JSON.stringify({ version: 1, lastSyncedCommit: "c", files: {}, remote: "x/y#z" }));
+		const c = new StateStore(moved, PATH);
+		await c.load("a/b#c");
+		expect(c.rebaselined).toBe(true);
+	});
+});
+
 describe("StateStore flush cadence", () => {
 	it("does not write on every setFile", async () => {
 		const { store, files } = makeStore();

@@ -235,7 +235,7 @@ describe("push", () => {
 		await gh.setFiles({ "a.md": "one" });
 		await engine.pull();
 		const summary = await engine.push();
-		expect(summary).toEqual({ pushed: 0, deletedRemote: 0, skipped: 0, commit: null });
+		expect(summary).toEqual({ pushed: 0, deletedRemote: 0, skipped: 0, skippedPaths: [], commit: null });
 		expect(gh.pushedTrees).toEqual([]);
 	});
 
@@ -833,6 +833,17 @@ describe("push protections", () => {
 		const plan = await engine.preview();
 		expect(plan.outgoing).toEqual([{ path: "huge.bin", action: "skip-oversize" }]);
 		expect(reads).not.toContain("huge.bin");
+	});
+
+	it("names the skipped paths in the push summary", async () => {
+		const { gh, files, engine } = makeEngine({ maxPushBytes: 4 });
+		await gh.setFiles({ "a.md": "one", "big.pdf": new Uint8Array([1, 2, 3]) });
+		await engine.pull();
+		await files.writeBinary("huge.md", text("way past the four byte cap"));
+		await files.writeBinary("big.pdf", text("scr"));
+		const push = await engine.push();
+		expect(push.skipped).toBe(2);
+		expect([...push.skippedPaths].sort()).toEqual(["big.pdf", "huge.md"]);
 	});
 
 	it("skips a file that disappears between listing and stat", async () => {

@@ -16,7 +16,7 @@ import { RingLogger } from "./log";
 import type { Files, Http, HttpRequest, HttpResponse } from "./ports";
 import { StateStore } from "./state";
 import { DEFAULT_TEXT_EXTENSIONS, SyncEngine } from "./sync";
-import type { SyncPlan } from "./sync";
+import type { PullSummary, PushSummary, SyncPlan } from "./sync";
 
 interface ComeGitherSettings {
 	owner: string;
@@ -290,6 +290,7 @@ export default class ComeGitherPlugin extends Plugin {
 		this.pluginDir = this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
 		this.vaultFiles = new AdapterFiles(this.app);
 		this.logger = new RingLogger(this.vaultFiles, `${this.pluginDir}/log.txt`);
+		await this.logger.init(); // keep the previous session's log for exports
 		this.statusEl = this.addStatusBarItem();
 		this.setStatus("idle");
 
@@ -353,7 +354,7 @@ export default class ComeGitherPlugin extends Plugin {
 		}
 		if (this.settings.autoSyncMinutes > 0) {
 			const minutes = Math.min(60, Math.max(3, this.settings.autoSyncMinutes));
-			this.intervalId = window.setInterval(() => void this.runSync(), minutes * 60_000);
+			this.intervalId = window.setInterval(() => void this.runSync(false, true), minutes * 60_000);
 			this.registerInterval(this.intervalId);
 		}
 	}
@@ -369,9 +370,14 @@ export default class ComeGitherPlugin extends Plugin {
 				owner: this.settings.owner,
 				repo: this.settings.repo,
 				token: this.settings.token,
+				log: this.logger.log,
 			});
 			const state = new StateStore(this.vaultFiles, `${this.pluginDir}/sync-state.json`);
 			await state.load(`${this.settings.owner}/${this.settings.repo}#${this.settings.branch}`);
+			if (state.rebaselined) {
+				this.logger.log("warn", "sync state was unreadable or pointed at another repository; re-baselining");
+				new Notice("Come Gither: sync state reset. The next sync re-scans the vault and can be slow.");
+			}
 			const engine = new SyncEngine(client, this.vaultFiles, state, this.logger.log, {
 				branch: this.settings.branch,
 				textExtensions: DEFAULT_TEXT_EXTENSIONS,
@@ -417,7 +423,7 @@ export default class ComeGitherPlugin extends Plugin {
 		}
 	}
 
-	async runSync(startup = false): Promise<void> {
+	async runSync(startup = false, quiet = startup): Promise<void> {
 		if (this.syncing) {
 			new Notice("Come Gither: a sync is already running.");
 			return;
@@ -428,20 +434,34 @@ export default class ComeGitherPlugin extends Plugin {
 		}
 		this.syncing = true;
 		this.setStatus("syncing…");
+		// The status bar is not shown on mobile, so a manual sync announces
+		// itself; interval and startup runs stay quiet.
+		if (!quiet) new Notice("Come Gither: syncing…");
 		try {
 			const engine = await this.getEngine();
-			const { pull, push } = await engine.sync();
+			// Startup honors the "Pull when Obsidian starts" toggle literally:
+			// it never pushes local edits or deletions without a command.
+			let pull: PullSummary;
+			let push: PushSummary | null = null;
+			if (startup) {
+				pull = await engine.pull();
+			} else {
+				({ pull, push } = await engine.sync());
+			}
 			await this.refreshLazyIndex();
 			const parts: string[] = [];
-			if (pull.upToDate && push.commit === null) parts.push("already up to date");
+			if (pull.upToDate && (push === null || push.commit === null)) parts.push("already up to date");
 			if (pull.fetched) parts.push(`${pull.fetched} fetched`);
 			if (pull.placeholders) parts.push(`${pull.placeholders} placeholders`);
 			if (pull.merged) parts.push(`${pull.merged} merged`);
 			if (pull.deleted) parts.push(`${pull.deleted} deleted here`);
 			if (pull.conflicts) parts.push(`${pull.conflicts} conflicts (see _conflicts/)`);
-			if (push.pushed) parts.push(`${push.pushed} pushed`);
-			if (push.deletedRemote) parts.push(`${push.deletedRemote} deleted on GitHub`);
-			if (push.skipped) parts.push(`${push.skipped} skipped`);
+			if (push?.pushed) parts.push(`${push.pushed} pushed`);
+			if (push?.deletedRemote) parts.push(`${push.deletedRemote} deleted on GitHub`);
+			if (push && push.skipped > 0) {
+				const names = push.skippedPaths.slice(0, 2).join(", ");
+				parts.push(`${push.skipped} skipped (${names}${push.skippedPaths.length > 2 ? ", …" : ""})`);
+			}
 			new Notice(`Come Gither: ${parts.join(", ") || "done"}.`);
 			this.setStatus("idle");
 		} catch (e) {
@@ -508,7 +528,10 @@ export default class ComeGitherPlugin extends Plugin {
 			const result = await engine.fetchLazy(path);
 			if (result === "fetched") {
 				this.lazySizes.delete(path);
-				const file = this.app.vault.getFileByPath(path);
+				// getAbstractFileByPath, not getFileByPath: the latter needs
+				// Obsidian 1.5.7 and the manifest promises 1.5.0.
+				const abstract = this.app.vault.getAbstractFileByPath(path);
+				const file = abstract instanceof TFile ? abstract : null;
 				if (file && leaf) await leaf.openFile(file);
 				else new Notice(`Come Gither: downloaded ${path}.`);
 			} else if (result === "modified") {
@@ -603,16 +626,16 @@ class ComeGitherSettingTab extends PluginSettingTab {
 			);
 		new Setting(containerEl)
 			.setName("Placeholder downloads")
-			.setDesc("Opening an unfetched file shows a download page, or downloads at once.")
+			.setDesc("Opening an unfetched file asks first, or downloads at once.")
 			.addDropdown((d) =>
 				d
-					.addOptions({ prompt: "Show a download page", auto: "Download immediately" })
+					.addOptions({ prompt: "Ask first", auto: "Download immediately" })
 					.setValue(s.lazyFetchMode)
 					.onChange((v) => ((s.lazyFetchMode = v as "prompt" | "auto"), save())),
 			);
 		new Setting(containerEl)
 			.setName("Largest automatic download (MB)")
-			.setDesc("Files above this size stay placeholders until you open them.")
+			.setDesc("Text files above this size, and all binary files, stay placeholders until you open them.")
 			.addText((t) =>
 				t.setValue(String(s.maxAutoFetchMB)).onChange((v) => {
 					const n = Number(v);

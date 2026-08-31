@@ -28,6 +28,22 @@ export class RingLogger {
 		}
 	};
 
+	/**
+	 * Seed the ring from the previous session's file, so the first flush of a
+	 * new session never erases the evidence of a crash. Call once at startup.
+	 */
+	async init(): Promise<void> {
+		let previous: string[] = [];
+		try {
+			const raw = new TextDecoder().decode(await this.files.readBinary(this.path));
+			if (raw.length > 0) previous = [...raw.split("\n"), "--- session start ---"];
+		} catch {
+			// no previous log; nothing to seed
+		}
+		this.lines = [...previous, ...this.lines];
+		while (this.lines.length > this.capacity) this.lines.shift();
+	}
+
 	dump(): string {
 		return this.lines.join("\n");
 	}
