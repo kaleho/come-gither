@@ -40,13 +40,23 @@ export class StateStore {
 	async load(expectedRemote?: string): Promise<void> {
 		this.lastFlushAt = this.now();
 		this.rebaselined = false;
-		const exists = (await this.files.stat(this.path)) !== null;
+		let exists = false;
+		try {
+			exists = (await this.files.stat(this.path)) !== null;
+		} catch {
+			// a transient stat failure must never reject the load
+		}
 		try {
 			const raw = new TextDecoder().decode(await this.files.readBinary(this.path));
 			const parsed = JSON.parse(raw);
 			// Corrupt, future-versioned, or misshapen state is never trusted:
 			// fall back to a re-baseline (slow, never destructive).
-			const usable = parsed !== null && parsed.version === 1 && typeof parsed.files === "object" && parsed.files !== null;
+			const usable =
+				parsed !== null &&
+				parsed.version === 1 &&
+				typeof parsed.files === "object" &&
+				parsed.files !== null &&
+				!Array.isArray(parsed.files);
 			this.state = usable ? parsed : empty();
 			this.rebaselined = !usable;
 		} catch {

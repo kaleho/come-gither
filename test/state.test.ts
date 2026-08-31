@@ -88,6 +88,24 @@ describe("StateStore remote identity", () => {
 		await store.load("a/b#c");
 		expect(store.state.files).toEqual({});
 		expect(store.rebaselined).toBe(true);
+		const arrayShape = new MemFiles();
+		arrayShape.writeText(PATH, JSON.stringify({ version: 1, remote: "a/b#c", files: [] }));
+		const store2 = new StateStore(arrayShape, PATH);
+		await store2.load("a/b#c");
+		expect(store2.state.files).toEqual({});
+		expect(store2.rebaselined).toBe(true);
+	});
+
+	it("survives a stat failure instead of rejecting the load", async () => {
+		// One transient adapter error must never reject load: a rejected session
+		// build would otherwise brick every later operation.
+		const files = new MemFiles();
+		files.stat = async () => {
+			throw new Error("adapter hiccup");
+		};
+		const store = new StateStore(files, PATH);
+		await expect(store.load("a/b#c")).resolves.toBeUndefined();
+		expect(store.state.files).toEqual({});
 	});
 });
 

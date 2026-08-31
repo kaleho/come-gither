@@ -357,6 +357,93 @@ describe("push", () => {
 	});
 });
 
+describe("revert safety net", () => {
+	it("saves an untracked file to _conflicts/ before deleting it", async () => {
+		// Reachable via a conflict-kept file (entry dropped) shown as "New file"
+		// in the preview: its Revert button must never destroy the only copy.
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "base" });
+		await engine.pull();
+		await files.writeBinary("note.md", text("precious"));
+		expect(await engine.revert("note.md")).toBe("reverted");
+		expect(await files.stat("note.md")).toBeNull();
+		expect(files.readText("_conflicts/note.md")).toBe("precious");
+	});
+});
+
+describe("case-only remote renames", () => {
+	it("never deletes the local file when a case-folded twin exists remotely", async () => {
+		const { gh, files, state, engine } = makeEngine();
+		await gh.setFiles({ "note.md": "content" });
+		await engine.pull();
+		// GitHub now holds the same path with different casing.
+		await gh.setFiles({ "Note.md": "content" });
+		const plan = await engine.preview();
+		expect(plan.incoming.find((r) => r.path === "note.md")).toBeUndefined();
+		await engine.pull();
+		// On a case-insensitive filesystem both names are one file; removing
+		// "note.md" would destroy it. The stale entry drops, the file stays.
+		expect(await files.stat("note.md")).not.toBeNull();
+		expect(state.state.files["note.md"]).toBeUndefined();
+	});
+});
+
+describe("retired engines", () => {
+	it("rejects new operations after retire while finishing queued ones", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one" });
+		await engine.pull();
+		await files.writeBinary("a.md", text("edited"));
+		let release!: () => void;
+		const gate = new Promise<void>((r) => (release = r));
+		gh.onCreateBlob = () => gate;
+		const syncing = engine.sync();
+		engine.retire();
+		await expect(engine.evict("a.md")).rejects.toThrow("retired");
+		gh.onCreateBlob = undefined;
+		release();
+		const { push } = await syncing; // the in-flight sync still completes
+		expect(push.commit).not.toBe(null);
+	});
+});
+
+describe("lazy placeholder deleted remotely", () => {
+	it("moves a scribbled stub to _conflicts/ instead of uploading its bytes", async () => {
+		const { gh, files, state, engine } = makeEngine();
+		await gh.setFiles({ "big.pdf": new Uint8Array([1, 2, 3]), "keep.md": "k" });
+		await engine.pull();
+		// The user typed into the empty placeholder; the real content was never
+		// downloaded, so those stub bytes must never become the file's content.
+		await files.writeBinary("big.pdf", text("scribble"));
+		await gh.setFiles({ "keep.md": "k" }); // big.pdf deleted on GitHub
+		const summary = await engine.pull();
+		expect(summary.conflicts).toBe(1);
+		expect(await files.stat("big.pdf")).toBeNull();
+		expect(files.readText("_conflicts/big.pdf")).toBe("scribble");
+		expect(state.state.files["big.pdf"]).toBeUndefined();
+		const push = await engine.push();
+		expect(push.commit).toBe(null); // nothing resurrects the stub bytes
+	});
+});
+
+describe("re-baseline memory safety", () => {
+	it("classifies a huge untracked local file without reading it when sizes differ", async () => {
+		const { gh, files, engine } = makeEngine({ maxPushBytes: 4 });
+		await gh.setFiles({ "video.mp4": new Uint8Array([1, 2, 3]) });
+		await files.writeBinary("video.mp4", text("local video bytes over the cap"));
+		const reads: string[] = [];
+		const orig = files.readBinary.bind(files);
+		files.readBinary = async (p) => {
+			reads.push(p);
+			return orig(p);
+		};
+		const plan = await engine.preview();
+		expect(reads).not.toContain("video.mp4");
+		expect(plan.incoming.length).toBe(1);
+		expect(plan.incoming[0].path).toBe("video.mp4");
+	});
+});
+
 describe("engine idle", () => {
 	it("resolves idle only after the queued operations settle", async () => {
 		const { gh, files, engine } = makeEngine();
