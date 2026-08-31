@@ -9,9 +9,9 @@ Real git implementations struggle on mobile with large repositories. Come Gither
 ## Features
 
 - **Two-way sync.** The plugin creates real commits on your repository. Other devices and plain git see normal history.
-- **Placeholders for large binaries.** Text files and `.obsidian/` sync fully. Binary files (PDFs, images, audio) arrive as empty placeholders. Open one, and the plugin offers to download it. A setting switches between "ask first" and "download immediately".
+- **Placeholders for large binaries.** Text files and the config folder sync fully, up to the download limit. Binary files (PDFs, images, audio) arrive as empty placeholders. Open one, and the plugin offers to download it. A setting switches between "ask first" and "download immediately".
 - **Free up space.** The command *Remove local copy (keep on GitHub)* turns a downloaded file back into a placeholder.
-- **Conflict resolution.** When both sides change a text file, the plugin merges the edits when they do not overlap. When they overlap, it keeps your local file and saves the server version under `_conflicts/` for review. A "remote wins" mode takes the server version instead. `.obsidian/` always takes the server version.
+- **Conflict resolution.** When both sides change a text file, the plugin merges the edits when they do not overlap. When they overlap, it keeps your local file and saves the server version under `_conflicts/` for review. A "remote wins" mode takes the server version instead. The config folder always takes the server version. When an overwrite would replace your changed file with a placeholder, your local copy is saved under `_conflicts/` first.
 - **Preview before you sync.** The command *Preview sync* lists incoming and outgoing changes. Each outgoing change has a Revert button.
 - **Safe interruption.** A killed or backgrounded pull resumes where it stopped. An interrupted upload restarts, but nothing appears on GitHub until the final commit lands.
 - **Log export.** The command *Export sync log* writes the sync log to a note, so you can share it from any device.
@@ -22,7 +22,7 @@ This plugin sends the contents of your vault to the GitHub API (`api.github.com`
 
 ## Token storage disclosure
 
-The plugin needs a GitHub personal access token (fine-grained, Contents read and write, scoped to one repository). The token is stored **in plain text** in the plugin's local settings file (`.obsidian/plugins/come-gither/data.json`) on each device. The plugin never syncs its own settings folder, so the token never leaves your device.
+The plugin needs a GitHub personal access token (fine-grained, Contents read and write, scoped to one repository). The token is stored **in plain text** in the plugin's local settings file (`data.json` in the plugin's folder under your vault's config folder, usually `.obsidian/plugins/come-gither/`) on each device. The plugin never syncs its own folder, so the token never leaves your device.
 
 ## Setup
 
@@ -39,13 +39,15 @@ The first sync of a large vault takes a while and is safe to interrupt. Start it
 - **Placeholder downloads** — ask first (default) or download immediately.
 - **Largest automatic download (MB)** — text files above this size, and all binary files, stay placeholders until you open them.
 - **Automatic sync interval (minutes)** — 0 is off; otherwise 3 to 60.
-- **Pull when Obsidian starts** — on by default.
+- **Pull when Obsidian starts** — on by default. The startup pull never pushes; local edits and deletions wait for a manual or interval sync.
 
 ## Limits
 
 - Files over 30 MB cannot be uploaded through the GitHub API. The plugin skips them with a warning; push them with desktop git.
 - Git LFS is not supported.
-- Syncing `.obsidian/` includes the code and settings of your other plugins. Anyone with write access to your repository can change what those plugins run. Use a repository only you control.
+- Syncing the config folder includes the code and settings of your other plugins. Anyone with write access to your repository can change what those plugins run. Use a repository only you control.
+- A conflict whose GitHub version is larger than the download limit is logged, but no copy lands in `_conflicts/`; resolve it with desktop git.
+- A new empty file is not uploaded until it has content.
 - A binary embedded in a note renders as broken until you open the file directly once.
 - Deletions sync both ways. Deleting a downloaded file locally deletes it on GitHub on the next sync. Deleting a placeholder does not; the placeholder returns.
 

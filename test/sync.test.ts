@@ -128,7 +128,7 @@ describe("pull: incremental", () => {
 		expect(state.state.files["b.md"]).toBeUndefined();
 	});
 
-	it("keeps a locally changed file that was deleted remotely", async () => {
+	it("keeps a locally changed file that was deleted remotely, dropping its entry", async () => {
 		const { gh, files, state, engine, logs } = makeEngine();
 		await gh.setFiles({ "a.md": "one", "b.md": "two" });
 		await engine.pull();
@@ -137,8 +137,28 @@ describe("pull: incremental", () => {
 		const summary = await engine.pull();
 		expect(summary.conflicts).toBe(1);
 		expect(files.readText("b.md")).toBe("edited");
-		expect(state.state.files["b.md"]).toBeDefined();
+		// The path no longer exists on GitHub, so a tracked entry could only make
+		// a later push emit an invalid delete. The kept file resurrects as new.
+		expect(state.state.files["b.md"]).toBeUndefined();
 		expect(logs.some((l) => l.includes("b.md"))).toBe(true);
+		const push = await engine.push();
+		expect(push.pushed).toBe(1);
+		expect(gh.filesByPath.has("b.md")).toBe(true);
+	});
+
+	it("does not wedge the push when a conflict-kept file is deleted later", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "base", "keep.md": "k" });
+		await engine.pull();
+		await files.writeBinary("a.md", new TextEncoder().encode("local edit").buffer as ArrayBuffer);
+		await gh.setFiles({ "keep.md": "k" }); // a.md deleted on GitHub
+		const s1 = await engine.pull();
+		expect(s1.conflicts).toBe(1);
+		// The user reads the kept file, agrees with the deletion, removes it.
+		await files.remove("a.md");
+		const push = await engine.push();
+		expect(push.commit).toBe(null);
+		expect(push.deletedRemote).toBe(0);
 	});
 
 	it("counts a conflict when a file was deleted locally but changed remotely", async () => {
@@ -334,6 +354,156 @@ describe("push", () => {
 		await files.writeBinary(".obsidian/plugins/come-gither/data.json", text("{token}"));
 		const summary = await engine.push();
 		expect(summary.commit).toBe(null);
+	});
+});
+
+describe("engine idle", () => {
+	it("resolves idle only after the queued operations settle", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one" });
+		await engine.pull();
+		await files.writeBinary("a.md", text("edited"));
+		let release!: () => void;
+		const gate = new Promise<void>((r) => (release = r));
+		gh.onCreateBlob = () => gate;
+		const syncing = engine.sync();
+		let idleDone = false;
+		const idling = engine.idle().then(() => {
+			idleDone = true;
+		});
+		await new Promise((r) => setTimeout(r, 0));
+		expect(idleDone).toBe(false);
+		gh.onCreateBlob = undefined;
+		release();
+		await syncing;
+		await idling;
+		expect(idleDone).toBe(true);
+	});
+});
+
+describe("excluded entries in push and preview", () => {
+	it("drops a newly excluded tracked entry instead of deleting it on GitHub", async () => {
+		// Upgrade shape: 0.3.x synced .trash/, 0.4 excludes it. The entry, the
+		// local file, and the remote file all still exist.
+		const { gh, files, state, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "x", ".trash/old.md": "y" });
+		await files.writeBinary(".trash/old.md", text("y"));
+		await engine.pull();
+		await state.setFile(".trash/old.md", {
+			baseBlobSha: await gitSha("y"),
+			size: 1,
+			mtime: (await files.stat(".trash/old.md"))?.mtime ?? 0,
+		});
+		const plan = await engine.preview();
+		expect(plan.outgoing).toEqual([]);
+		const push = await engine.push();
+		expect(push.deletedRemote).toBe(0);
+		expect(push.commit).toBe(null);
+		expect(gh.filesByPath.has(".trash/old.md")).toBe(true);
+		expect(state.state.files[".trash/old.md"]).toBeUndefined();
+	});
+});
+
+describe("blob cache integrity", () => {
+	it("never serves another file's bytes when content mutates mid-push", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "keep.md": "k" });
+		await engine.pull();
+		await files.writeBinary("a.md", text("shared"));
+		await files.writeBinary("b.md", text("shared"));
+		// Mutate a.md between its change-detection read and its upload read.
+		const orig = files.readBinary.bind(files);
+		let aReads = 0;
+		files.readBinary = async (p) => {
+			if (p === "a.md") {
+				aReads += 1;
+				if (aReads === 2) files.store.set("a.md", new TextEncoder().encode("mutated"));
+			}
+			return orig(p);
+		};
+		await engine.sync();
+		const b = gh.filesByPath.get("b.md");
+		expect(new TextDecoder().decode(b?.bytes as Uint8Array)).toBe("shared");
+	});
+
+	it("keeps the running push's blob cache when another sync is queued", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one" });
+		await engine.pull();
+		await files.writeBinary("new.md", text("fresh"));
+		gh.failUpdateRefTimes = 1;
+		let second: Promise<unknown> = Promise.resolve();
+		gh.onUpdateRef = () => {
+			gh.onUpdateRef = undefined;
+			second = engine.sync(); // queued mid-push; must not wipe the cache
+		};
+		await engine.sync();
+		await second;
+		expect(gh.createBlobCalls).toBe(1);
+	});
+});
+
+describe("lazy entry healing", () => {
+	it("marks a lazy entry non-lazy when the full content is present", async () => {
+		const { gh, files, state, engine } = makeEngine();
+		await gh.setFiles({ "big.pdf": new Uint8Array([1, 2, 3]) });
+		await engine.pull();
+		await engine.fetchLazy("big.pdf");
+		// Crash shape: the download landed but a stale lazy entry survived.
+		const entry = state.state.files["big.pdf"];
+		await state.setFile("big.pdf", {
+			baseBlobSha: entry.baseBlobSha,
+			size: 0,
+			mtime: 0,
+			lazy: true,
+			remoteSize: 3,
+		});
+		await engine.push();
+		expect(state.state.files["big.pdf"].lazy).toBeUndefined();
+		// Later edits sync normally instead of being skipped as a placeholder.
+		await files.writeBinary("big.pdf", text("edited"));
+		const push = await engine.push();
+		expect(push.skipped).toBe(0);
+		expect(push.pushed).toBe(1);
+	});
+});
+
+describe("oversize healing", () => {
+	it("heals a touched-but-identical oversize file silently", async () => {
+		const { gh, files, engine } = makeEngine({ maxPushBytes: 4 });
+		await gh.setFiles({ "big.md": "elevenbytes" });
+		await engine.pull();
+		await files.writeBinary("big.md", text("elevenbytes")); // mtime drift only
+		// The preview (read-only) already hides the drifted file...
+		const plan = await engine.preview();
+		expect(plan.outgoing).toEqual([]);
+		// ...and the push heals the fingerprint silently.
+		const push = await engine.push();
+		expect(push.skipped).toBe(0);
+		expect(push.commit).toBe(null);
+	});
+
+	it("still skips an oversize file whose content changed", async () => {
+		const { gh, files, engine } = makeEngine({ maxPushBytes: 4 });
+		await gh.setFiles({ "big.md": "elevenbytes" });
+		await engine.pull();
+		await files.writeBinary("big.md", text("ELEVENBYTES"));
+		const push = await engine.push();
+		expect(push.skipped).toBe(1);
+		expect(push.skippedPaths).toEqual(["big.md"]);
+	});
+});
+
+describe("config dir case folding", () => {
+	it("pins the config-folder overwrite case-insensitively", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ ".Obsidian/app.json": "{}" });
+		await engine.pull();
+		await files.writeBinary(".Obsidian/app.json", text("{local}"));
+		await gh.setFiles({ ".Obsidian/app.json": "{remote}" });
+		const summary = await engine.pull();
+		expect(summary.conflicts).toBe(0);
+		expect(files.readText(".Obsidian/app.json")).toBe("{remote}");
 	});
 });
 
@@ -1070,6 +1240,25 @@ describe("config dir and exclusions", () => {
 });
 
 describe("operation serialization", () => {
+	it("queues a lazy fetch behind a running sync", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one", "big.pdf": new Uint8Array([9, 9]) });
+		await engine.pull();
+		await files.writeBinary("a.md", text("edited"));
+		let release!: () => void;
+		const gate = new Promise<void>((r) => (release = r));
+		gh.onCreateBlob = () => gate;
+		const syncing = engine.sync();
+		const fetching = engine.fetchLazy("big.pdf");
+		await new Promise((r) => setTimeout(r, 0));
+		expect((await files.stat("big.pdf"))?.size).toBe(0); // still a stub
+		gh.onCreateBlob = undefined;
+		release();
+		await syncing;
+		expect(await fetching).toBe("fetched");
+		expect((await files.stat("big.pdf"))?.size).toBe(2);
+	});
+
 	it("queues an evict behind a running sync instead of racing it", async () => {
 		const { gh, files, engine } = makeEngine();
 		await gh.setFiles({ "a.md": "one", "big.pdf": new Uint8Array([1, 2, 3]) });

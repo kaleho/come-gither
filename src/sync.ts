@@ -124,6 +124,11 @@ export class SyncEngine {
 		return run;
 	}
 
+	/** Resolves when every operation queued so far has settled. */
+	idle(): Promise<void> {
+		return this.chain.then(() => undefined);
+	}
+
 	fetchLazy(path: string): Promise<"fetched" | "not-lazy" | "modified"> {
 		return this.locked(() => this.doFetchLazy(path));
 	}
@@ -141,13 +146,19 @@ export class SyncEngine {
 	}
 
 	push(): Promise<PushSummary> {
-		this.uploadedBlobs.clear();
-		return this.locked(() => this.doPush());
+		// Cleared inside the lock: clearing at call time would wipe the cache
+		// of an operation still running ahead of this one in the queue.
+		return this.locked(() => {
+			this.uploadedBlobs.clear();
+			return this.doPush();
+		});
 	}
 
 	sync(): Promise<{ pull: PullSummary; push: PushSummary }> {
-		this.uploadedBlobs.clear();
-		return this.locked(() => this.doSync());
+		return this.locked(() => {
+			this.uploadedBlobs.clear();
+			return this.doSync();
+		});
 	}
 
 	pull(): Promise<PullSummary> {
@@ -226,6 +237,9 @@ export class SyncEngine {
 			if (!stat) continue;
 			if (entry && stat.mtime === entry.mtime && stat.size === entry.size) continue;
 			if (stat.size > this.config.maxPushBytes) {
+				if (entry && stat.size === entry.size && (await this.localShaIfChanged(path, entry, false)) === "clean") {
+					continue; // only the mtime drifted; sync will heal it silently
+				}
 				plan.outgoing.push({ path, action: "skip-oversize" });
 				continue;
 			}
@@ -240,7 +254,7 @@ export class SyncEngine {
 		}
 		for (const path of Object.keys(this.state.state.files)) {
 			const entry = this.state.state.files[path];
-			if (localPaths.has(path) || agreedDeleted.has(path)) continue;
+			if (localPaths.has(path) || agreedDeleted.has(path) || this.excluded(path)) continue;
 			plan.outgoing.push({ path, action: entry.lazy ? "restore-placeholder" : "deleted" });
 		}
 		return plan;
@@ -284,6 +298,11 @@ export class SyncEngine {
 			if (entry && stat.mtime === entry.mtime && stat.size === entry.size) continue;
 			if (stat.size > this.config.maxPushBytes) {
 				// Checked before hashing: never read a file the API cannot accept.
+				// A same-size tracked file gets one confirming hash so a bare
+				// mtime drift heals instead of warning on every sync forever.
+				if (entry && stat.size === entry.size && (await this.localShaIfChanged(path, entry)) === "clean") {
+					continue;
+				}
 				summary.skipped += 1;
 				summary.skippedPaths.push(path);
 				this.log("warn", `${path} is ${stat.size} bytes, over the push limit; push it from desktop git`);
@@ -298,15 +317,20 @@ export class SyncEngine {
 				continue;
 			}
 			if (!entry && localSha === EMPTY_BLOB_SHA) {
-				// An untracked zero-byte stub is stale state, not content: pushing
-				// it would blank the real remote file. The next pull re-tracks it.
-				this.log("info", `${path} is an untracked empty stub; leaving it for the next pull`);
+				// An untracked zero-byte file carries no content: pushing it could
+				// blank a real remote file whose state entry was lost. It stays
+				// local until it has content (or until a pull re-tracks its path).
+				this.log("info", `${path} is an untracked empty file; not pushing it until it has content`);
 				continue;
 			}
-			let sha = this.uploadedBlobs.get(localSha);
+			// One read serves both the cache key and the upload, so the cache can
+			// never map one file's content sha to another file's uploaded bytes.
+			const data = await this.files.readBinary(path);
+			const contentSha = await gitBlobSha1(data);
+			let sha = this.uploadedBlobs.get(contentSha);
 			if (sha === undefined) {
-				sha = await this.gh.createBlob(await this.files.readBinary(path));
-				this.uploadedBlobs.set(localSha, sha);
+				sha = await this.gh.createBlob(data);
+				this.uploadedBlobs.set(contentSha, sha);
 			}
 			treeEntries.push({ path, mode: entry?.mode ?? "100644", type: "blob", sha });
 			// The fingerprint from before the read: an edit made during the slow
@@ -320,6 +344,13 @@ export class SyncEngine {
 		let restoredPlaceholders = 0;
 		for (const path of Object.keys(this.state.state.files)) {
 			if (localPaths.has(path)) continue;
+			if (this.excluded(path)) {
+				// A path excluded after it was tracked (an upgrade widened the
+				// list) is not a local deletion; drop the entry, never the
+				// remote file.
+				await this.state.removeFile(path);
+				continue;
+			}
 			const entry = this.state.state.files[path];
 			if (entry.lazy) {
 				// A deleted placeholder must never delete the real remote file;
@@ -527,7 +558,12 @@ export class SyncEngine {
 		}
 		if (localSha !== "clean") {
 			summary.conflicts += 1;
-			this.log("warn", `conflict on ${path}: deleted remotely but changed locally, keeping it`);
+			// Keep the file, drop the entry: the path no longer exists on GitHub,
+			// so a tracked entry could only make a later push emit a delete for a
+			// path absent from the base tree (GitHub rejects that with a 422).
+			// The kept file, now untracked, uploads as a new file on push.
+			await this.state.removeFile(path);
+			this.log("warn", `conflict on ${path}: deleted on GitHub but changed locally; keeping it (it uploads as a new file on the next push)`);
 			return;
 		}
 		await this.files.remove(path);
@@ -552,12 +588,17 @@ export class SyncEngine {
 		if (!stat) return "missing";
 		if (stat.mtime === entry.mtime && stat.size === entry.size) return "clean";
 		const sha = await gitBlobSha1(await this.files.readBinary(path));
+		if (sha === entry.baseBlobSha) {
+			// The full content is present. Recording lazy=false also heals a
+			// stale lazy flag left by an interrupted evict or download, which
+			// would otherwise strand every later edit as a "modified placeholder".
+			if (refresh) await this.record(path, entry.baseBlobSha, false, undefined, entry.mode);
+			return "clean";
+		}
 		// A lazy entry whose content is still empty is an untouched stub whose
 		// mtime drifted (backup restore, file-provider touch): clean, re-stamp.
-		if (sha === entry.baseBlobSha || (entry.lazy === true && sha === EMPTY_BLOB_SHA)) {
-			if (refresh) {
-				await this.record(path, entry.baseBlobSha, entry.lazy === true, entry.remoteSize, entry.mode); // refresh fingerprint
-			}
+		if (entry.lazy === true && sha === EMPTY_BLOB_SHA) {
+			if (refresh) await this.record(path, entry.baseBlobSha, true, entry.remoteSize, entry.mode);
 			return "clean";
 		}
 		return sha;
@@ -606,7 +647,9 @@ export class SyncEngine {
 	}
 
 	private inConfigDir(path: string): boolean {
-		return path.startsWith(`${this.config.configDir}/`);
+		// Case-folded like excluded(): on case-insensitive filesystems a
+		// differently-cased remote path writes into the same local folder.
+		return path.toLowerCase().startsWith(`${this.config.configDir.toLowerCase()}/`);
 	}
 
 	private excluded(path: string): boolean {

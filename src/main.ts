@@ -267,8 +267,11 @@ export default class ComeGitherPlugin extends Plugin {
 	private intervalId: number | null = null;
 	// One engine + one StateStore for the whole plugin: every entry point shares
 	// them, and the engine's internal lock serializes the operations. Two stores
-	// over the same sync-state.json would clobber each other's flushes.
-	private session: { engine: SyncEngine; state: StateStore } | null = null;
+	// over the same sync-state.json would clobber each other's flushes. The
+	// PROMISE is cached, not the result, so concurrent first callers (the two
+	// onLayoutReady kicks) can never each build their own engine; and a settings
+	// change rebuilds only after the old engine's queue drains.
+	private sessionPromise: Promise<{ engine: SyncEngine; state: StateStore }> | null = null;
 	// Paths with an open download prompt or a download in flight; file-open
 	// events for them are ignored so modals never stack.
 	private busyPaths = new Set<string>();
@@ -336,7 +339,17 @@ export default class ComeGitherPlugin extends Plugin {
 
 	async saveSettings(): Promise<void> {
 		await this.saveData(this.settings);
-		this.session = null; // the engine's client config may have changed
+		// The engine's client config may have changed. Never drop a live engine:
+		// the replacement is built only after the old one's operations settle,
+		// so two engines can never run over the same files and state.
+		const old = this.sessionPromise;
+		if (old !== null) {
+			this.sessionPromise = (async () => {
+				const previous = await old.catch(() => null);
+				if (previous) await previous.engine.idle();
+				return this.buildSession();
+			})();
+		}
 		this.applyAutoSyncInterval();
 	}
 
@@ -357,32 +370,38 @@ export default class ComeGitherPlugin extends Plugin {
 		return Boolean(owner && repo && branch && token);
 	}
 
+	private getSession(): Promise<{ engine: SyncEngine; state: StateStore }> {
+		this.sessionPromise ??= this.buildSession();
+		return this.sessionPromise;
+	}
+
 	private async getEngine(): Promise<SyncEngine> {
-		if (!this.session) {
-			const client = new GitHubClient(new ObsidianHttp(), {
-				owner: this.settings.owner,
-				repo: this.settings.repo,
-				token: this.settings.token,
-				log: this.logger.log,
-			});
-			const state = new StateStore(this.vaultFiles, `${this.pluginDir}/sync-state.json`);
-			await state.load(`${this.settings.owner}/${this.settings.repo}#${this.settings.branch}`);
-			if (state.rebaselined) {
-				this.logger.log("warn", "sync state was unreadable or pointed at another repository; re-baselining");
-				new Notice("Come Gither: sync state reset. The next sync re-scans the vault and can be slow.");
-			}
-			const engine = new SyncEngine(client, this.vaultFiles, state, this.logger.log, {
-				branch: this.settings.branch,
-				textExtensions: DEFAULT_TEXT_EXTENSIONS,
-				maxAutoFetchBytes: this.settings.maxAutoFetchMB * 1048576,
-				maxPushBytes: MAX_PUSH_BYTES,
-				conflictPolicy: this.settings.conflictPolicy,
-				configDir: this.app.vault.configDir,
-				excludedPrefixes: ["_conflicts/", `${this.pluginDir}/`, ".git/", ".trash/"],
-			});
-			this.session = { engine, state };
+		return (await this.getSession()).engine;
+	}
+
+	private async buildSession(): Promise<{ engine: SyncEngine; state: StateStore }> {
+		const client = new GitHubClient(new ObsidianHttp(), {
+			owner: this.settings.owner,
+			repo: this.settings.repo,
+			token: this.settings.token,
+			log: this.logger.log,
+		});
+		const state = new StateStore(this.vaultFiles, `${this.pluginDir}/sync-state.json`);
+		await state.load(`${this.settings.owner}/${this.settings.repo}#${this.settings.branch}`);
+		if (state.rebaselined) {
+			this.logger.log("warn", "sync state was unreadable or pointed at another repository; re-baselining");
+			new Notice("Come Gither: sync state reset. The next sync re-scans the vault and can be slow.");
 		}
-		return this.session.engine;
+		const engine = new SyncEngine(client, this.vaultFiles, state, this.logger.log, {
+			branch: this.settings.branch,
+			textExtensions: DEFAULT_TEXT_EXTENSIONS,
+			maxAutoFetchBytes: this.settings.maxAutoFetchMB * 1048576,
+			maxPushBytes: MAX_PUSH_BYTES,
+			conflictPolicy: this.settings.conflictPolicy,
+			configDir: this.app.vault.configDir,
+			excludedPrefixes: ["_conflicts/", `${this.pluginDir}/`, ".git/", ".trash/"],
+		});
+		return { engine, state };
 	}
 
 	async openPreview(): Promise<void> {
@@ -418,7 +437,7 @@ export default class ComeGitherPlugin extends Plugin {
 
 	async runSync(startup = false, quiet = startup): Promise<void> {
 		if (this.syncing) {
-			new Notice("Come Gither: a sync is already running.");
+			if (!quiet) new Notice("Come Gither: a sync is already running.");
 			return;
 		}
 		if (!this.configured()) {
@@ -448,14 +467,17 @@ export default class ComeGitherPlugin extends Plugin {
 			if (pull.placeholders) parts.push(`${pull.placeholders} placeholders`);
 			if (pull.merged) parts.push(`${pull.merged} merged`);
 			if (pull.deleted) parts.push(`${pull.deleted} deleted here`);
-			if (pull.conflicts) parts.push(`${pull.conflicts} conflicts (see _conflicts/)`);
+			if (pull.conflicts) parts.push(`${pull.conflicts} conflicts (see _conflicts/ and the log)`);
 			if (push?.pushed) parts.push(`${push.pushed} pushed`);
 			if (push?.deletedRemote) parts.push(`${push.deletedRemote} deleted on GitHub`);
 			if (push && push.skipped > 0) {
 				const names = push.skippedPaths.slice(0, 2).join(", ");
 				parts.push(`${push.skipped} skipped (${names}${push.skippedPaths.length > 2 ? ", …" : ""})`);
 			}
-			new Notice(`Come Gither: ${parts.join(", ") || "done"}.`);
+			// A quiet run reports only real work; "already up to date" every
+			// interval tick would be noise.
+			const happened = parts.some((p) => p !== "already up to date");
+			if (!quiet || happened) new Notice(`Come Gither: ${parts.join(", ") || "done"}.`);
 			this.setStatus("idle");
 		} catch (e) {
 			const message = e instanceof Error ? e.message : String(e);
@@ -469,8 +491,9 @@ export default class ComeGitherPlugin extends Plugin {
 	}
 
 	private async refreshLazyIndex(): Promise<void> {
-		await this.getEngine();
-		const state = (this.session as { state: StateStore }).state;
+		// Use the resolved session, never a re-read of the mutable field: a
+		// settings save can swap it between the await and the read.
+		const { state } = await this.getSession();
 		this.lazySizes.clear();
 		for (const [path, entry] of Object.entries(state.state.files)) {
 			if (entry.lazy) this.lazySizes.set(path, entry.remoteSize ?? 0);
@@ -489,10 +512,8 @@ export default class ComeGitherPlugin extends Plugin {
 			}
 			return;
 		}
-		if (this.syncing) {
-			this.logger.log("info", `opened placeholder ${file.path} during a sync; ignoring`);
-			return;
-		}
+		// A running sync is no reason to ignore the open: the engine lock queues
+		// the download safely behind it, and downloadAndOpen says so.
 		if (this.busyPaths.has(file.path)) return; // a prompt is open or a download runs
 		this.logger.log("info", `opened placeholder ${file.path} (mode: ${this.settings.lazyFetchMode})`);
 		const leaf = this.app.workspace.getMostRecentLeaf();
@@ -517,6 +538,10 @@ export default class ComeGitherPlugin extends Plugin {
 	async downloadAndOpen(path: string, leaf?: WorkspaceLeaf): Promise<void> {
 		this.busyPaths.add(path);
 		try {
+			if (this.syncing) {
+				this.logger.log("info", `download of ${path} queued behind the running sync`);
+				new Notice("Come Gither: the download starts when the running sync finishes.");
+			}
 			const engine = await this.getEngine();
 			const result = await engine.fetchLazy(path);
 			if (result === "fetched") {
@@ -543,11 +568,23 @@ export default class ComeGitherPlugin extends Plugin {
 		}
 	}
 
+	private detachLeavesShowing(path: string): void {
+		// An open view still holds the full pre-evict content in its buffer; a
+		// later save would silently write it back over the stub. Close it.
+		const leaves: WorkspaceLeaf[] = [];
+		this.app.workspace.iterateAllLeaves((leaf) => {
+			const shown = (leaf.view as { file?: TFile }).file;
+			if (shown?.path === path) leaves.push(leaf);
+		});
+		for (const leaf of leaves) leaf.detach();
+	}
+
 	private async evictFile(file: TFile): Promise<void> {
 		try {
 			const engine = await this.getEngine();
 			const result = await engine.evict(file.path);
 			if (result === "evicted") {
+				this.detachLeavesShowing(file.path);
 				await this.refreshLazyIndex();
 				new Notice(`Come Gither: removed the local copy of ${file.name}. It stays on GitHub.`);
 			} else if (result === "modified") {
