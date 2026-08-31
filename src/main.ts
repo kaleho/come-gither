@@ -161,6 +161,7 @@ const INCOMING_LABELS: Record<string, string> = {
 	placeholder: "Placeholder will be added",
 	delete: "Will be deleted here",
 	"both-changed": "Conflict: merge will be tried",
+	"deleted-conflict": "Deleted here; the GitHub copy goes to _conflicts/",
 	"keep-local": "Deleted on GitHub, kept here",
 	adopt: "Already identical",
 	overwrite: "GitHub version will be taken",
@@ -169,6 +170,7 @@ const OUTGOING_LABELS: Record<string, string> = {
 	new: "New file",
 	modified: "Changed",
 	deleted: "Will be deleted on GitHub",
+	"restore-placeholder": "Deleted placeholder will be restored",
 	"skip-oversize": "Skipped: too large to push",
 	"skip-placeholder": "Skipped: modified placeholder",
 };
@@ -223,7 +225,11 @@ class PreviewView extends ItemView {
 		refreshBtn.addEventListener("click", () => void this.reload());
 
 		if (plan.incoming.length === 0 && plan.outgoing.length === 0) {
-			root.createEl("p", { text: "Nothing to sync. Everything matches GitHub." });
+			root.createEl("p", {
+				text: plan.headMoved
+					? "No file changes. GitHub advanced without touching synced files; Sync now records the new baseline."
+					: "Nothing to sync. Everything matches GitHub.",
+			});
 			return;
 		}
 
