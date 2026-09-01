@@ -263,37 +263,17 @@ describe("GitHubClient errors", () => {
 		expect(err.kind).toBe("too-large");
 	});
 
-	it("prefers window.setTimeout for the default sleep when a window exists", async () => {
-		vi.useFakeTimers();
-		const g = globalThis as { window?: { setTimeout(handler: () => void, timeout: number): unknown } };
-		let viaWindow = 0;
-		g.window = {
-			setTimeout: (handler: () => void, timeout: number) => {
-				viaWindow += 1;
-				return setTimeout(handler, timeout);
-			},
-		};
-		try {
-			const http = new FakeHttp();
-			http.on("POST", "/git/blobs", jsonResponse({ sha: "b" }, 201));
-			const client = new GitHubClient(http, { owner: "kaleho", repo: "vault", token: "tok123" });
-			await client.createBlob(new ArrayBuffer(1));
-			const second = client.createBlob(new ArrayBuffer(1));
-			await vi.advanceTimersByTimeAsync(1000);
-			await second;
-			expect(viaWindow).toBeGreaterThan(0);
-		} finally {
-			delete g.window;
-			vi.useRealTimers();
-		}
-	});
-
-	it("uses the real clock and timer when none are injected", async () => {
+	it("uses the real clock when no clock is injected", async () => {
 		vi.useFakeTimers();
 		try {
 			const http = new FakeHttp();
 			http.on("POST", "/git/blobs", jsonResponse({ sha: "b" }, 201));
-			const client = new GitHubClient(http, { owner: "kaleho", repo: "vault", token: "tok123" });
+			const client = new GitHubClient(http, {
+				owner: "kaleho",
+				repo: "vault",
+				token: "tok123",
+				sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+			});
 			await client.createBlob(new ArrayBuffer(1));
 			const second = client.createBlob(new ArrayBuffer(1));
 			await vi.advanceTimersByTimeAsync(1000);

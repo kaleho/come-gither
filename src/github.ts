@@ -31,7 +31,12 @@ export interface GitHubClientOptions {
 	owner: string;
 	repo: string;
 	token: string;
-	sleep?: (ms: number) => Promise<void>;
+	/**
+	 * Timer for throttle and backoff waits. The caller owns the timer source:
+	 * the plugin passes a window.setTimeout-based sleep (popout-window safe),
+	 * tests pass a virtual clock. This module never touches a global timer.
+	 */
+	sleep: (ms: number) => Promise<void>;
 	now?: () => number;
 	log?: (level: "info" | "warn" | "error", message: string) => void;
 }
@@ -60,15 +65,7 @@ export class GitHubClient {
 		private http: Http,
 		private opts: GitHubClientOptions,
 	) {
-		// window.setTimeout keeps timers alive in popout windows; the fallback
-		// covers the test runtime, where no window exists.
-		this.sleep =
-			opts.sleep ??
-			((ms) =>
-				new Promise((resolve) => {
-					const w = (globalThis as { window?: { setTimeout(handler: () => void, timeout: number): unknown } }).window;
-					(w ?? globalThis).setTimeout(resolve, ms);
-				}));
+		this.sleep = opts.sleep;
 		this.now = opts.now ?? (() => Date.now());
 	}
 
