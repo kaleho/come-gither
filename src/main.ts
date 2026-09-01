@@ -408,6 +408,7 @@ export default class ComeGitherPlugin extends Plugin {
 			owner: this.settings.owner,
 			repo: this.settings.repo,
 			token: this.settings.token,
+			sleep: (ms) => new Promise((resolve) => window.setTimeout(resolve, ms)),
 			log: this.logger.log,
 		});
 		const state = new StateStore(this.vaultFiles, `${this.pluginDir}/sync-state.json`);
