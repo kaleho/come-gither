@@ -27,6 +27,10 @@ export interface SyncConfig {
 	configDir: string;
 	/** Path prefixes never synced in either direction, matched case-insensitively. */
 	excludedPrefixes: string[];
+	/** One operation deleting more than this many files needs confirmation (Infinity = off). */
+	maxDeletions: number;
+	/** Asked before an over-threshold deletion; it proceeds only on true. Absent = always abort. */
+	confirmDeletions?: (direction: "local" | "remote", paths: string[]) => Promise<boolean>;
 }
 
 export const DEFAULT_TEXT_EXTENSIONS = [
@@ -453,6 +457,8 @@ export class SyncEngine {
 			return summary;
 		}
 
+		await this.guardDeletions("remote", droppedPaths);
+
 		const base = this.state.state.lastSyncedCommit as string;
 		const { treeSha: baseTree } = await this.gh.getCommit(base);
 		const newTree = await this.gh.createTree(baseTree, treeEntries);
@@ -517,6 +523,7 @@ export class SyncEngine {
 
 		const remoteLower = new Set([...remote.keys()].map((p) => p.toLowerCase()));
 		let localList: string[] | null = null;
+		const deleteCandidates: string[] = [];
 		for (const path of Object.keys(this.state.state.files)) {
 			if (remote.has(path) || this.excluded(path)) continue;
 			if (remoteLower.has(path.toLowerCase())) {
@@ -531,8 +538,18 @@ export class SyncEngine {
 					continue;
 				}
 			}
-			await this.applyRemoteDelete(path, summary);
+			deleteCandidates.push(path);
 		}
+		// Guard before the first delete: only clean local files actually vanish
+		// (dirty ones are kept or parked, already-missing ones are agreement).
+		const realDeletes: string[] = [];
+		for (const path of deleteCandidates) {
+			if ((await this.localShaIfChanged(path, this.state.state.files[path], false)) === "clean") {
+				realDeletes.push(path);
+			}
+		}
+		await this.guardDeletions("local", realDeletes);
+		for (const path of deleteCandidates) await this.applyRemoteDelete(path, summary);
 
 		await this.state.setCommit(head);
 		this.log(
@@ -681,6 +698,22 @@ export class SyncEngine {
 		await this.files.remove(path);
 		await this.state.removeFile(path);
 		summary.deleted += 1;
+	}
+
+	/**
+	 * The mass-deletion guard: a wiped device or a wrong remote must never
+	 * silently propagate. Over the threshold, the operation aborts unless the
+	 * wired confirmer (a modal in main.ts) explicitly approves.
+	 */
+	private async guardDeletions(direction: "local" | "remote", paths: string[]): Promise<void> {
+		if (paths.length <= this.config.maxDeletions) return;
+		const where = direction === "local" ? "on this device" : "on GitHub";
+		this.log("warn", `deletion guard: this sync wants to delete ${paths.length} files ${where}: ${paths.slice(0, 5).join(", ")}${paths.length > 5 ? ", …" : ""}`);
+		if (this.config.confirmDeletions !== undefined && (await this.config.confirmDeletions(direction, paths))) {
+			this.log("info", `deleting ${paths.length} files ${where} was confirmed`);
+			return;
+		}
+		throw new Error(`cancelled: this sync would delete ${paths.length} files ${where}; confirm it or raise the deletion guard threshold`);
 	}
 
 	/**

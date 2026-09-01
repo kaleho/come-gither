@@ -13,6 +13,8 @@ function makeEngine(
 		configDir?: string;
 		excludedPrefixes?: string[];
 		files?: MemFiles;
+		maxDeletions?: number;
+		confirmDeletions?: (direction: "local" | "remote", paths: string[]) => Promise<boolean>;
 	} = {},
 ) {
 	const gh = new FakeGitHub();
@@ -32,6 +34,8 @@ function makeEngine(
 			".git/",
 			".trash/",
 		],
+		maxDeletions: overrides.maxDeletions ?? Infinity,
+		confirmDeletions: overrides.confirmDeletions,
 	});
 	return { gh, files, state, engine, logs };
 }
@@ -960,6 +964,7 @@ describe("state persistence across engine instances", () => {
 			conflictPolicy: "merge",
 			configDir: ".obsidian",
 			excludedPrefixes: ["_conflicts/", ".obsidian/plugins/come-gither/", ".git/", ".trash/"],
+			maxDeletions: Infinity,
 		});
 		return { state, engine };
 	}
@@ -1590,5 +1595,129 @@ describe("stale empty stubs", () => {
 		await gh.setFiles({ "empty.md": "" });
 		const summary = await engine.pull();
 		expect(summary.adopted).toBe(1); // identical empty content adopts, no fetch
+	});
+});
+
+describe("deletion guard", () => {
+	/** Seed the remote with n tracked notes and pull them clean. */
+	async function seed(gh: FakeGitHub, engine: SyncEngine, n: number): Promise<void> {
+		const contents: Record<string, string> = {};
+		for (let i = 0; i < n; i++) contents[`n/${i}.md`] = `note ${i}`;
+		await gh.setFiles(contents);
+		await engine.pull();
+	}
+
+	it("pull: aborts a mass local deletion when no confirmer is wired", async () => {
+		const { gh, files, state, engine } = makeEngine({ maxDeletions: 2 });
+		await seed(gh, engine, 3);
+		await gh.setFiles({});
+		await expect(engine.pull()).rejects.toThrow(/delete 3 files on this device/);
+		expect(await files.stat("n/0.md")).not.toBeNull();
+		expect(state.state.files["n/0.md"]).toBeDefined();
+		expect(state.state.lastSyncedCommit).not.toBe(gh.head);
+	});
+
+	it("pull: asks the confirmer and deletes when it says yes", async () => {
+		const asked: { direction: string; paths: string[] }[] = [];
+		const { gh, files, engine } = makeEngine({
+			maxDeletions: 2,
+			confirmDeletions: async (direction, paths) => {
+				asked.push({ direction, paths });
+				return true;
+			},
+		});
+		await seed(gh, engine, 3);
+		await gh.setFiles({});
+		const summary = await engine.pull();
+		expect(summary.deleted).toBe(3);
+		expect(asked).toEqual([{ direction: "local", paths: ["n/0.md", "n/1.md", "n/2.md"] }]);
+		expect(await files.stat("n/0.md")).toBeNull();
+	});
+
+	it("pull: a declined confirmation aborts and deletes nothing", async () => {
+		const { gh, files, engine } = makeEngine({ maxDeletions: 0, confirmDeletions: async () => false });
+		await seed(gh, engine, 1);
+		await gh.setFiles({});
+		await expect(engine.pull()).rejects.toThrow(/cancelled/);
+		expect(await files.stat("n/0.md")).not.toBeNull();
+	});
+
+	it("pull: at or under the threshold nothing is asked", async () => {
+		let asked = 0;
+		const { gh, engine } = makeEngine({
+			maxDeletions: 3,
+			confirmDeletions: async () => {
+				asked += 1;
+				return true;
+			},
+		});
+		await seed(gh, engine, 3);
+		await gh.setFiles({});
+		const summary = await engine.pull();
+		expect(summary.deleted).toBe(3);
+		expect(asked).toBe(0);
+	});
+
+	it("pull: only clean local files count toward the threshold", async () => {
+		// Three tracked paths vanish remotely: one changed locally (kept), one
+		// already gone locally (agreement) — only one clean file really deletes.
+		const { gh, files, engine } = makeEngine({ maxDeletions: 1 });
+		await seed(gh, engine, 3);
+		files.writeText("n/1.md", "edited locally");
+		await files.remove("n/2.md");
+		await gh.setFiles({});
+		const summary = await engine.pull();
+		expect(summary.deleted).toBe(2); // the clean delete plus the agreement
+		expect(summary.conflicts).toBe(1);
+		expect(await files.stat("n/0.md")).toBeNull();
+		expect(await files.stat("n/1.md")).not.toBeNull();
+	});
+
+	it("logs at most five of the paths it is about to delete", async () => {
+		const { gh, engine, logs } = makeEngine({ maxDeletions: 2 });
+		await seed(gh, engine, 7);
+		await gh.setFiles({});
+		await expect(engine.pull()).rejects.toThrow(/delete 7 files/);
+		const warn = logs.find((l) => l.includes("deletion guard")) as string;
+		expect(warn).toContain("n/4.md, …");
+		expect(warn).not.toContain("n/5.md");
+	});
+
+	it("push: aborts a mass remote deletion when no confirmer is wired", async () => {
+		const { gh, files, state, engine } = makeEngine({ maxDeletions: 2 });
+		await seed(gh, engine, 3);
+		const before = gh.head;
+		for (const p of ["n/0.md", "n/1.md", "n/2.md"]) await files.remove(p);
+		await expect(engine.push()).rejects.toThrow(/delete 3 files on GitHub/);
+		expect(gh.head).toBe(before);
+		expect(gh.filesByPath.has("n/0.md")).toBe(true);
+		expect(state.state.files["n/0.md"]).toBeDefined();
+	});
+
+	it("push: asks the confirmer with the remote direction and proceeds on yes", async () => {
+		const asked: { direction: string; paths: string[] }[] = [];
+		const { gh, files, engine } = makeEngine({
+			maxDeletions: 0,
+			confirmDeletions: async (direction, paths) => {
+				asked.push({ direction, paths });
+				return true;
+			},
+		});
+		await seed(gh, engine, 2);
+		await files.remove("n/0.md");
+		const summary = await engine.push();
+		expect(summary.deletedRemote).toBe(1);
+		expect(asked).toEqual([{ direction: "remote", paths: ["n/0.md"] }]);
+		expect(gh.filesByPath.has("n/0.md")).toBe(false);
+	});
+
+	it("push: a restored placeholder does not count as a deletion", async () => {
+		const { gh, files, engine } = makeEngine({ maxDeletions: 0, confirmDeletions: async () => false });
+		await gh.setFiles({ "big.bin": new Uint8Array([1, 2, 3]) });
+		await engine.pull();
+		await files.remove("big.bin");
+		const summary = await engine.push(); // restores the stub; no guard fires
+		expect(summary.deletedRemote).toBe(0);
+		expect((await files.stat("big.bin"))?.size).toBe(0);
 	});
 });
