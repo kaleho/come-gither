@@ -60,19 +60,27 @@ export class GitHubClient {
 		private http: Http,
 		private opts: GitHubClientOptions,
 	) {
-		this.sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+		// window.setTimeout keeps timers alive in popout windows; the fallback
+		// covers the test runtime, where no window exists.
+		this.sleep =
+			opts.sleep ??
+			((ms) =>
+				new Promise((resolve) => {
+					const w = (globalThis as { window?: { setTimeout(handler: () => void, timeout: number): unknown } }).window;
+					(w ?? globalThis).setTimeout(resolve, ms);
+				}));
 		this.now = opts.now ?? (() => Date.now());
 	}
 
 	async getRef(branch: string): Promise<string> {
 		const res = await this.call("GET", `/git/ref/heads/${branch}`);
-		return this.json(res).object.sha;
+		return this.json<{ object: { sha: string } }>(res).object.sha;
 	}
 
 	async getCommit(sha: string): Promise<{ treeSha: string; parents: string[] }> {
 		const res = await this.call("GET", `/git/commits/${sha}`);
-		const body = this.json(res);
-		return { treeSha: body.tree.sha, parents: body.parents.map((p: { sha: string }) => p.sha) };
+		const body = this.json<{ tree: { sha: string }; parents: { sha: string }[] }>(res);
+		return { treeSha: body.tree.sha, parents: body.parents.map((p) => p.sha) };
 	}
 
 	async getTree(
@@ -80,7 +88,7 @@ export class GitHubClient {
 		recursive: boolean,
 	): Promise<{ entries: TreeEntry[]; truncated: boolean }> {
 		const res = await this.call("GET", `/git/trees/${sha}${recursive ? "?recursive=1" : ""}`);
-		const body = this.json(res);
+		const body = this.json<{ tree: TreeEntry[]; truncated: boolean }>(res);
 		return { entries: body.tree, truncated: body.truncated };
 	}
 
@@ -100,7 +108,7 @@ export class GitHubClient {
 			content: toBase64(data),
 			encoding: "base64",
 		});
-		return this.json(res).sha;
+		return this.json<{ sha: string }>(res).sha;
 	}
 
 	async createTree(baseTree: string, entries: TreeEntry[]): Promise<string> {
@@ -108,7 +116,7 @@ export class GitHubClient {
 			base_tree: baseTree,
 			tree: entries.map(({ path, mode, type, sha }) => ({ path, mode, type, sha })),
 		});
-		return this.json(res).sha;
+		return this.json<{ sha: string }>(res).sha;
 	}
 
 	async createCommit(message: string, treeSha: string, parents: string[]): Promise<string> {
@@ -117,7 +125,7 @@ export class GitHubClient {
 			tree: treeSha,
 			parents,
 		});
-		return this.json(res).sha;
+		return this.json<{ sha: string }>(res).sha;
 	}
 
 	async updateRef(branch: string, sha: string): Promise<void> {
@@ -185,7 +193,8 @@ export class GitHubClient {
 	private toError(res: HttpResponse, path: string, rateLimited: boolean, delayMs?: number): GitHubError {
 		let message = `GitHub ${res.status} on ${path}`;
 		try {
-			message = `${message}: ${JSON.parse(res.text).message}`;
+			const body = JSON.parse(res.text) as { message?: unknown };
+			if (typeof body.message === "string") message = `${message}: ${body.message}`;
 		} catch {
 			// non-JSON error body; keep the generic message
 		}
@@ -201,7 +210,7 @@ export class GitHubClient {
 		return new GitHubError(res.status, kind, message);
 	}
 
-	private json(res: HttpResponse): any {
-		return JSON.parse(res.text);
+	private json<T>(res: HttpResponse): T {
+		return JSON.parse(res.text) as T;
 	}
 }

@@ -94,6 +94,14 @@ describe("StateStore remote identity", () => {
 		await store2.load("a/b#c");
 		expect(store2.state.files).toEqual({});
 		expect(store2.rebaselined).toBe(true);
+		for (const raw of ["null", "42"]) {
+			const odd = new MemFiles();
+			odd.writeText(PATH, raw);
+			const store3 = new StateStore(odd, PATH);
+			await store3.load("a/b#c");
+			expect(store3.state.files).toEqual({});
+			expect(store3.rebaselined).toBe(true);
+		}
 	});
 
 	it("survives a stat failure instead of rejecting the load", async () => {

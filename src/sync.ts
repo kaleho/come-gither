@@ -218,7 +218,6 @@ export class SyncEngine {
 		const localPaths = new Set(
 			(await this.files.listRecursive("")).filter((p) => !this.excluded(p)),
 		);
-		const localLower = new Set([...localPaths].map((p) => p.toLowerCase()));
 		const head = await this.gh.getRef(this.config.branch);
 		if (head !== this.state.state.lastSyncedCommit) {
 			plan.headMoved = true;
@@ -638,7 +637,7 @@ export class SyncEngine {
 				const merged = threeWayMerge(decode(localData), decode(baseData), decode(remoteData));
 				if (merged !== null) {
 					// The merged text stays a local change; the next push commits it.
-					await this.files.writeBinary(path, new TextEncoder().encode(merged).buffer as ArrayBuffer);
+					await this.files.writeBinary(path, new TextEncoder().encode(merged).buffer);
 					summary.merged += 1;
 					this.log("info", `auto-merged ${path}`);
 					return;

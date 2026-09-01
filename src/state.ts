@@ -24,6 +24,18 @@ function empty(): SyncState {
 	return { version: 1, lastSyncedCommit: null, files: {} };
 }
 
+/** Corrupt, future-versioned, or misshapen state is never trusted. */
+function isUsableState(value: unknown): value is SyncState {
+	if (typeof value !== "object" || value === null) return false;
+	const shape = value as { version?: unknown; files?: unknown };
+	return (
+		shape.version === 1 &&
+		typeof shape.files === "object" &&
+		shape.files !== null &&
+		!Array.isArray(shape.files)
+	);
+}
+
 export class StateStore {
 	state: SyncState = empty();
 	/** True when the last load discarded an unusable or re-pointed state file. */
@@ -51,17 +63,15 @@ export class StateStore {
 			// A successful read proves the file exists even when stat failed; the
 			// identity guard below must never be skipped for a readable file.
 			exists = true;
-			const parsed = JSON.parse(raw);
-			// Corrupt, future-versioned, or misshapen state is never trusted:
-			// fall back to a re-baseline (slow, never destructive).
-			const usable =
-				parsed !== null &&
-				parsed.version === 1 &&
-				typeof parsed.files === "object" &&
-				parsed.files !== null &&
-				!Array.isArray(parsed.files);
-			this.state = usable ? parsed : empty();
-			this.rebaselined = !usable;
+			const parsed: unknown = JSON.parse(raw);
+			if (isUsableState(parsed)) {
+				this.state = parsed;
+				this.rebaselined = false;
+			} else {
+				// Fall back to a re-baseline (slow, never destructive).
+				this.state = empty();
+				this.rebaselined = true;
+			}
 		} catch {
 			this.state = empty();
 			this.rebaselined = exists; // a fresh vault has no file and is not a re-baseline
@@ -96,7 +106,7 @@ export class StateStore {
 
 	async flush(): Promise<void> {
 		const raw = new TextEncoder().encode(JSON.stringify(this.state));
-		await this.files.writeBinary(this.path, raw.buffer as ArrayBuffer);
+		await this.files.writeBinary(this.path, raw.buffer);
 		this.dirty = 0;
 		this.lastFlushAt = this.now();
 	}
