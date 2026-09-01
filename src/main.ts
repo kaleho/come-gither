@@ -30,6 +30,7 @@ interface ComeGitherSettings {
 	maxAutoFetchMB: number;
 	autoSyncMinutes: number; // 0 = off; otherwise clamped to 3..60
 	pullOnStart: boolean;
+	deletionGuardThreshold: number; // 0 = off; a sync deleting more files asks first
 }
 
 const DEFAULT_SETTINGS: ComeGitherSettings = {
@@ -42,6 +43,7 @@ const DEFAULT_SETTINGS: ComeGitherSettings = {
 	maxAutoFetchMB: 100,
 	autoSyncMinutes: 0,
 	pullOnStart: true,
+	deletionGuardThreshold: 10,
 };
 
 const MAX_PUSH_BYTES = 30 * 1048576;
@@ -140,6 +142,42 @@ class ConfirmFetchModal extends Modal {
 				}),
 			)
 			.addButton((b) => b.setButtonText("Not now").onClick(() => this.close()));
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+		this.onDone(this.confirmed);
+	}
+}
+
+class ConfirmDeletionsModal extends Modal {
+	private confirmed = false;
+
+	constructor(
+		app: App,
+		private direction: "local" | "remote",
+		private paths: string[],
+		private onDone: (confirmed: boolean) => void,
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		const where = this.direction === "local" ? "on this device" : "on GitHub";
+		this.contentEl.createEl("p", {
+			text: `This sync wants to delete ${this.paths.length} files ${where}. If you did not delete them yourself, cancel and check the sync preview.`,
+		});
+		const list = this.contentEl.createEl("ul");
+		for (const path of this.paths.slice(0, 20)) list.createEl("li", { text: path });
+		if (this.paths.length > 20) list.createEl("li", { text: `… and ${this.paths.length - 20} more` });
+		new Setting(this.contentEl)
+			.addButton((b) =>
+				b.setButtonText(`Delete ${this.paths.length} files`).setWarning().onClick(() => {
+					this.confirmed = true;
+					this.close();
+				}),
+			)
+			.addButton((b) => b.setButtonText("Cancel").setCta().onClick(() => this.close()));
 	}
 
 	onClose(): void {
@@ -428,6 +466,9 @@ export default class ComeGitherPlugin extends Plugin {
 			conflictPolicy: this.settings.conflictPolicy,
 			configDir: this.app.vault.configDir,
 			excludedPrefixes: ["_conflicts/", `${this.pluginDir}/`, ".git/", ".trash/"],
+			maxDeletions: this.settings.deletionGuardThreshold > 0 ? this.settings.deletionGuardThreshold : Infinity,
+			confirmDeletions: (direction, paths) =>
+				new Promise((resolve) => new ConfirmDeletionsModal(this.app, direction, paths, resolve).open()),
 		});
 		return { engine, state };
 	}
@@ -716,6 +757,11 @@ class ComeGitherSettingTab extends PluginSettingTab {
 				control: { type: "number", key: "autoSyncMinutes", min: 0, max: 60, defaultValue: 0 },
 			},
 			{ name: "Pull when Obsidian starts", control: { type: "toggle", key: "pullOnStart" } },
+			{
+				name: "Deletion guard threshold",
+				desc: "A sync that would delete more files than this asks first. 0 turns the guard off.",
+				control: { type: "number", key: "deletionGuardThreshold", min: 0, defaultValue: DEFAULT_SETTINGS.deletionGuardThreshold },
+			},
 		];
 	}
 
@@ -732,6 +778,9 @@ class ComeGitherSettingTab extends PluginSettingTab {
 		} else if (key === "maxAutoFetchMB") {
 			const n = Number(value);
 			s[key] = Number.isFinite(n) && n > 0 ? n : DEFAULT_SETTINGS.maxAutoFetchMB;
+		} else if (key === "deletionGuardThreshold") {
+			const n = Math.round(Number(value));
+			s[key] = Number.isFinite(n) && n >= 0 ? n : DEFAULT_SETTINGS.deletionGuardThreshold;
 		} else {
 			s[key] = value;
 		}
@@ -806,5 +855,17 @@ class ComeGitherSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Pull when Obsidian starts")
 			.addToggle((t) => t.setValue(s.pullOnStart).onChange((v) => ((s.pullOnStart = v), save())));
+		new Setting(containerEl)
+			.setName("Deletion guard threshold")
+			.setDesc("A sync that would delete more files than this asks first. 0 turns the guard off.")
+			.addText((t) =>
+				t.setValue(String(s.deletionGuardThreshold)).onChange((v) => {
+					const n = Math.round(Number(v));
+					if (Number.isFinite(n) && n >= 0) {
+						s.deletionGuardThreshold = n;
+						save();
+					}
+				}),
+			);
 	}
 }
