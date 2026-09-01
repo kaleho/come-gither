@@ -57,6 +57,6 @@ export class RingLogger {
 	async flush(): Promise<void> {
 		this.sinceFlush = 0;
 		const data = new TextEncoder().encode(this.dump());
-		await this.files.writeBinary(this.path, data.buffer as ArrayBuffer);
+		await this.files.writeBinary(this.path, data.buffer);
 	}
 }

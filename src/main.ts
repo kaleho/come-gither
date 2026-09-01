@@ -13,6 +13,7 @@ import {
 } from "obsidian";
 import { GitHubClient } from "./github";
 import { RingLogger } from "./log";
+import type { SettingDefinitionItem } from "obsidian";
 import type { Files, Http, HttpRequest, HttpResponse } from "./ports";
 import { StateStore } from "./state";
 import { DEFAULT_TEXT_EXTENSIONS, SyncEngine } from "./sync";
@@ -286,7 +287,7 @@ export default class ComeGitherPlugin extends Plugin {
 	private pluginDir!: string;
 
 	async onload(): Promise<void> {
-		this.settings = { ...DEFAULT_SETTINGS, ...((await this.loadData()) ?? {}) };
+		this.settings = { ...DEFAULT_SETTINGS, ...(((await this.loadData()) ?? {}) as Partial<ComeGitherSettings>) };
 		this.pluginDir = this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
 		this.vaultFiles = new AdapterFiles(this.app);
 		this.logger = new RingLogger(this.vaultFiles, `${this.pluginDir}/log.txt`);
@@ -576,8 +577,7 @@ export default class ComeGitherPlugin extends Plugin {
 			const result = await engine.fetchLazy(path);
 			if (result === "fetched") {
 				this.lazySizes.delete(path);
-				// getAbstractFileByPath, not getFileByPath: the latter needs
-				// Obsidian 1.5.7 and the manifest promises 1.5.0.
+				// getAbstractFileByPath works on every supported version.
 				const abstract = this.app.vault.getAbstractFileByPath(path);
 				const file = abstract instanceof TFile ? abstract : null;
 				if (file) {
@@ -665,7 +665,7 @@ export default class ComeGitherPlugin extends Plugin {
 		await this.logger.flush();
 		const target = normalizePath(`come-gither-log-${new Date().toISOString().slice(0, 10)}.md`);
 		const body = `# Come Gither sync log\n\n\`\`\`\n${this.logger.dump()}\n\`\`\`\n`;
-		await this.vaultFiles.writeBinary(target, new TextEncoder().encode(body).buffer as ArrayBuffer);
+		await this.vaultFiles.writeBinary(target, new TextEncoder().encode(body).buffer);
 		new Notice(`Come Gither: log exported to ${target}.`);
 	}
 
@@ -680,6 +680,61 @@ class ComeGitherSettingTab extends PluginSettingTab {
 		private plugin: ComeGitherPlugin,
 	) {
 		super(app, plugin);
+	}
+
+	// Declarative definitions feed Obsidian's settings search on 1.13+.
+	// display() below still renders the tab for every supported version.
+	getSettingDefinitions(): SettingDefinitionItem[] {
+		return [
+			{ name: "Repository owner", desc: "The GitHub user or organization.", control: { type: "text", key: "owner" } },
+			{ name: "Repository name", desc: "The repository that holds your vault.", control: { type: "text", key: "repo" } },
+			{ name: "Branch", desc: "The branch to sync with.", control: { type: "text", key: "branch", defaultValue: "main" } },
+			{
+				name: "Personal access token",
+				desc: "Fine-grained token with Contents read and write. Stored in plain text on this device only.",
+				control: { type: "text", key: "token" },
+			},
+			{
+				name: "Conflict policy",
+				desc: "Merge tries a three-way merge and saves the remote copy of unresolved conflicts under _conflicts/. Remote wins takes the server version.",
+				control: { type: "dropdown", key: "conflictPolicy", options: { merge: "Merge", "remote-wins": "Remote wins" } },
+			},
+			{
+				name: "Placeholder downloads",
+				desc: "Opening an unfetched file asks first, or downloads at once.",
+				control: { type: "dropdown", key: "lazyFetchMode", options: { prompt: "Ask first", auto: "Download immediately" } },
+			},
+			{
+				name: "Largest automatic download (MB)",
+				desc: "Text files above this size, and all binary files, stay placeholders until you open them.",
+				control: { type: "number", key: "maxAutoFetchMB", min: 1, defaultValue: DEFAULT_SETTINGS.maxAutoFetchMB },
+			},
+			{
+				name: "Automatic sync interval (minutes)",
+				desc: "0 turns it off. Other values land between 3 and 60.",
+				control: { type: "number", key: "autoSyncMinutes", min: 0, max: 60, defaultValue: 0 },
+			},
+			{ name: "Pull when Obsidian starts", control: { type: "toggle", key: "pullOnStart" } },
+		];
+	}
+
+	getControlValue(key: string): unknown {
+		return this.plugin.settings[key as keyof ComeGitherSettings];
+	}
+
+	async setControlValue(key: string, value: unknown): Promise<void> {
+		const s = this.plugin.settings as unknown as Record<string, unknown>;
+		if (key === "owner" || key === "repo" || key === "branch" || key === "token") {
+			s[key] = String(value ?? "").trim();
+		} else if (key === "autoSyncMinutes") {
+			s[key] = clampSyncMinutes(Number(value));
+		} else if (key === "maxAutoFetchMB") {
+			const n = Number(value);
+			s[key] = Number.isFinite(n) && n > 0 ? n : DEFAULT_SETTINGS.maxAutoFetchMB;
+		} else {
+			s[key] = value;
+		}
+		await this.plugin.saveSettings();
 	}
 
 	display(): void {
