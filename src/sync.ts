@@ -304,7 +304,7 @@ export class SyncEngine {
 			plan.outgoing.push({ path, action: entry.lazy ? "restore-placeholder" : "deleted" });
 		}
 		for (const [path, entry] of Object.entries(this.state.state.files)) {
-			if (!entry.keep || uploads.has(path.toLowerCase())) continue;
+			if (!entry.keep || uploads.has(path.toLowerCase()) || this.excluded(path)) continue;
 			// A kept file deleted again before the push just drops out.
 			if (localPaths.has(path) || entry.lazy) plan.outgoing.push({ path, action: "restore-remote" });
 		}
@@ -351,10 +351,11 @@ export class SyncEngine {
 		// files go back to GitHub, and an UNTRACKED twin on disk is a case
 		// rename of this file (the drop loop below applies the same rule).
 		const listedSet = new Set(listed);
+		const listedByLower = new Map(listed.map((p) => [p.toLowerCase(), p]));
 		const guarded = Object.keys(this.state.state.files).filter((p) => {
 			const entry = this.state.state.files[p];
 			if (listedSet.has(p) || this.excluded(p) || entry.lazy || entry.keep) return false;
-			const twin = listed.find((q) => q.toLowerCase() === p.toLowerCase());
+			const twin = listedByLower.get(p.toLowerCase());
 			return twin === undefined || this.state.state.files[twin] !== undefined;
 		});
 		if ((await this.guardDeletions("remote", guarded)) === "keep") {
@@ -554,19 +555,25 @@ export class SyncEngine {
 		}
 		const { treeSha } = await this.gh.getCommit(head);
 		const remote = await this.listRemote(treeSha);
-		const remoteLower = new Set([...remote.keys()].map((p) => p.toLowerCase()));
+		const remoteByLower = new Map([...remote.keys()].map((p) => [p.toLowerCase(), p]));
+
+		// `keep` means "absent on GitHub": a path GitHub has again drops the
+		// mark, or a later push would re-add the old blob over the new one.
+		const back = Object.entries(this.state.state.files).filter(([p, e]) => e.keep && remote.has(p));
+		if (back.length > 0) {
+			await this.state.setFiles(Object.fromEntries(back.map(([p, { keep: _, ...rest }]) => [p, rest])));
+		}
 
 		// Decided before any write, so a deferred pull leaves the vault as it
 		// was. Only clean files vanish (dirty ones are kept or parked, missing
-		// ones are agreement); a case-only rename on GitHub is not a deletion.
+		// ones are agreement). A GitHub twin this device does not track is the
+		// new name of a case-only rename, not a deletion (push applies the
+		// same rule to an untracked twin on disk).
 		const guarded: string[] = [];
-		let listedBefore: string[] | null = null;
 		for (const [path, entry] of Object.entries(this.state.state.files)) {
 			if (remote.has(path) || this.excluded(path) || entry.keep) continue;
-			if (remoteLower.has(path.toLowerCase())) {
-				listedBefore ??= await this.files.listRecursive("");
-				if (await this.isOneFileCaseRename(path, remote, listedBefore)) continue;
-			}
+			const twin = remoteByLower.get(path.toLowerCase());
+			if (twin !== undefined && this.state.state.files[twin] === undefined) continue;
 			if ((await this.localShaIfChanged(path, entry, false)) === "clean") guarded.push(path);
 		}
 		if ((await this.guardDeletions("local", guarded)) === "keep") {
@@ -586,7 +593,7 @@ export class SyncEngine {
 		let localList: string[] | null = null;
 		for (const [path, entry] of Object.entries(this.state.state.files)) {
 			if (remote.has(path) || this.excluded(path) || entry.keep) continue;
-			if (remoteLower.has(path.toLowerCase())) {
+			if (remoteByLower.has(path.toLowerCase())) {
 				// A case-only rename on GitHub. On a case-insensitive filesystem
 				// the differently-cased twin owns the same physical file, and
 				// removing this path would destroy it; on a case-sensitive one
@@ -689,6 +696,14 @@ export class SyncEngine {
 		localSha: string,
 		summary: PullSummary,
 	): Promise<void> {
+		if (entry && localSha === "missing") {
+			// Deleted here, changed on GitHub: the entry must describe GitHub's
+			// version, or a later Keep would restore the stale one as "synced".
+			await this.state.setFile(
+				path,
+				entry.lazy ? { ...entry, baseBlobSha: blob.sha, remoteSize: blob.size } : { ...entry, baseBlobSha: blob.sha, size: blob.size },
+			);
+		}
 		if (blob.size > this.config.maxAutoFetchBytes) {
 			// Never buffer an oversize blob just to record a conflict.
 			summary.conflicts += 1;
