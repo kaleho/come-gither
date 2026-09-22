@@ -27,7 +27,7 @@ The plugin needs a GitHub personal access token (fine-grained, Contents read and
 ## Setup
 
 1. Create a fine-grained personal access token with Contents read and write access to your vault repository.
-2. Install the plugin and open its settings.
+2. [Install the plugin](#install) and open its settings.
 3. Enter the repository owner, name, branch, and your token.
 4. Run the command **Sync now**.
 
@@ -40,6 +40,7 @@ The first sync of a large vault takes a while and is safe to interrupt. Start it
 - **Largest automatic download (MB)** — text files above this size, and all binary files, stay placeholders until you open them.
 - **Automatic sync interval (minutes)** — 0 is off; otherwise 3 to 60.
 - **Pull when Obsidian starts** — on by default. The startup pull never pushes; local edits and deletions wait for a manual or interval sync.
+- **Deletion guard threshold** — 10 by default. A sync that would delete more files than this, on the device or on GitHub, stops and asks first. 0 turns the guard off.
 
 ## Limits
 
@@ -49,11 +50,19 @@ The first sync of a large vault takes a while and is safe to interrupt. Start it
 - A conflict whose GitHub version is larger than the download limit is logged, but no copy lands in `_conflicts/`; resolve it with desktop git.
 - A new empty file is not uploaded until it has content.
 - A binary embedded in a note renders as broken until you open the file directly once.
-- Deletions sync both ways. Deleting a downloaded file locally deletes it on GitHub on the next sync. Deleting a placeholder does not; the placeholder returns.
+- Deletions sync both ways. Deleting a downloaded file locally deletes it on GitHub on the next sync. Deleting a placeholder does not; the placeholder returns. A sync that would delete more files than the deletion guard threshold asks first; if you cancel, nothing is deleted.
 
-## Install (before the community listing is live)
+## Install
 
-Install [BRAT](https://obsidian.md/plugins?id=obsidian42-brat), then add `kaleho/come-gither` as a beta plugin. BRAT updates it from GitHub releases.
+Come Gither is in the Obsidian community plugin list.
+
+1. In Obsidian, open **Settings → Community plugins**.
+2. Select **Browse**, then search for "Come Gither".
+3. Select **Install**, then **Enable**.
+
+You can also open the [plugin page](https://obsidian.md/plugins?id=come-gither) and select **Install**. Obsidian updates the plugin like any other community plugin.
+
+If you installed an earlier version through BRAT, you can remove the BRAT entry. The community version replaces it.
 
 ## License
 

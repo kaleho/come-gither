@@ -1,0 +1,54 @@
+name: Bug report
+description: Something synced wrong, failed, or lost data.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for the report. The sync log is the most useful part: run the command **Export sync log**, open the note it writes (`come-gither-log-<date>.md`), and paste its contents below.
+
+        Remove file names you do not want to share before you paste. The log never contains your token.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect, and what did the plugin do instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Edit a note on the iPad
+        2. Run Sync now
+        3. ...
+  - type: input
+    id: version
+    attributes:
+      label: Plugin version
+      description: Settings → Community plugins → Come Gither.
+      placeholder: "0.5.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      multiple: true
+      options:
+        - iPad / iPhone
+        - Android
+        - macOS
+        - Windows
+        - Linux
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Sync log
+      description: Paste the exported sync log.
+      render: text
+    validations:
+      required: true
