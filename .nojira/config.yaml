@@ -1,0 +1,3 @@
+embedder:
+  base_url: http://localhost:4429/v1
+  model: bge-m3
