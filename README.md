@@ -40,7 +40,7 @@ The first sync of a large vault takes a while and is safe to interrupt. Start it
 - **Largest automatic download (MB)** — text files above this size, and all binary files, stay placeholders until you open them.
 - **Automatic sync interval (minutes)** — 0 is off; otherwise 3 to 60.
 - **Pull when Obsidian starts** — on by default. The startup pull never pushes; local edits and deletions wait for a manual or interval sync.
-- **Deletion guard threshold** — 10 by default. A sync that would delete more files than this, on the device or on GitHub, stops and asks first. 0 turns the guard off.
+- **Deletion guard threshold** — 10 by default. A pull that would delete more files than this on the device, or a push that would delete more than this on GitHub, stops and asks first. 0 turns the guard off.
 
 ## Limits
 
@@ -50,7 +50,7 @@ The first sync of a large vault takes a while and is safe to interrupt. Start it
 - A conflict whose GitHub version is larger than the download limit is logged, but no copy lands in `_conflicts/`; resolve it with desktop git.
 - A new empty file is not uploaded until it has content.
 - A binary embedded in a note renders as broken until you open the file directly once.
-- Deletions sync both ways. Deleting a downloaded file locally deletes it on GitHub on the next sync. Deleting a placeholder does not; the placeholder returns. A sync that would delete more files than the deletion guard threshold asks first; if you cancel, nothing is deleted.
+- Deletions sync both ways. Deleting a downloaded file locally deletes it on GitHub on the next sync. Deleting a placeholder does not; the placeholder returns. A pull or push that would delete more files than the deletion guard threshold asks first. If you cancel, nothing is deleted.
 
 ## Install
 
