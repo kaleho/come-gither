@@ -18,7 +18,15 @@ import type { Files, Http, HttpRequest, HttpResponse } from "./ports";
 import { StateStore } from "./state";
 import { DEFAULT_TEXT_EXTENSIONS, DeletionsDeferred, SyncEngine } from "./sync";
 import type { DeletionDecision, PullSummary, PushSummary, SyncPlan } from "./sync";
-import { cacheBustedUrl, clampSyncMinutes, lowercaseHeaders, maxDeletionsFor, parentDirs, parseDeletionThreshold } from "./wire";
+import {
+	cacheBustedUrl,
+	clampSyncMinutes,
+	confirmOrDefer,
+	lowercaseHeaders,
+	maxDeletionsFor,
+	parentDirs,
+	parseDeletionThreshold,
+} from "./wire";
 
 interface ComeGitherSettings {
 	owner: string;
@@ -174,8 +182,8 @@ class ConfirmDeletionsModal extends Modal {
 		this.contentEl.createEl("p", {
 			text:
 				this.direction === "local"
-					? "Delete them here too, or keep them? Kept files upload to GitHub again."
-					: "Delete them on GitHub, or keep them? Kept files download to this device again.",
+					? "Delete them here too, or keep them? Kept files go back to GitHub on this sync."
+					: "Delete them on GitHub, or keep them? Kept files come back to this device; large files and binaries come back as placeholders.",
 		});
 		const list = this.contentEl.createEl("ul");
 		for (const path of this.paths.slice(0, 20)) list.createEl("li", { text: path });
@@ -215,6 +223,7 @@ const OUTGOING_LABELS: Record<string, string> = {
 	"restore-placeholder": "Deleted placeholder will be restored",
 	"skip-oversize": "Skipped: too large to push",
 	"skip-placeholder": "Skipped: modified placeholder",
+	"restore-remote": "Kept: goes back to GitHub",
 };
 const REVERTIBLE = new Set(["new", "modified", "deleted"]);
 
@@ -481,9 +490,10 @@ export default class ComeGitherPlugin extends Plugin {
 			excludedPrefixes: ["_conflicts/", `${this.pluginDir}/`, ".git/", ".trash/"],
 			maxDeletions: maxDeletionsFor(this.settings.deletionGuardThreshold),
 			confirmDeletions: (direction, paths) =>
-				this.unattended
-					? Promise.resolve("defer")
-					: new Promise((resolve) => new ConfirmDeletionsModal(this.app, direction, paths, resolve).open()),
+				confirmOrDefer(
+					this.unattended,
+					() => new Promise((resolve) => new ConfirmDeletionsModal(this.app, direction, paths, resolve).open()),
+				),
 		});
 		return { engine, state };
 	}
@@ -571,8 +581,10 @@ export default class ComeGitherPlugin extends Plugin {
 			this.setStatus("idle");
 		} catch (e) {
 			if (e instanceof DeletionsDeferred) {
-				// Not a failure: nothing changed, and a manual sync asks. One
-				// Notice per episode, not one per interval tick.
+				// Not a failure: the guarded half wrote nothing, and a manual sync
+				// asks. A pull before a deferred push did apply, so the lazy index
+				// still needs its refresh. One Notice per episode, not per tick.
+				await this.refreshLazyIndex();
 				if (!this.deferNoticed) {
 					this.deferNoticed = true;
 					new Notice(`Come Gither: ${e.message}.`);

@@ -35,7 +35,11 @@ export interface SyncConfig {
 
 export type DeletionDecision = "delete" | "keep" | "defer";
 
-/** Thrown when the deletion guard defers: nothing was written, and a later sync asks again. */
+/**
+ * Thrown when the deletion guard defers: the guarded pull or push wrote
+ * nothing, and a later manual sync asks again. In a sync, a pull that ran
+ * before a deferred push stays applied.
+ */
 export class DeletionsDeferred extends Error {}
 
 export const DEFAULT_TEXT_EXTENSIONS = [
@@ -75,7 +79,8 @@ export type OutgoingAction =
 	| "deleted"
 	| "restore-placeholder"
 	| "skip-oversize"
-	| "skip-placeholder";
+	| "skip-placeholder"
+	| "restore-remote";
 
 export interface SyncPlan {
 	headMoved: boolean;
@@ -211,7 +216,7 @@ export class SyncEngine {
 		// Persist the lazy intent BEFORE truncating: a crash between the two steps
 		// leaves a lazy entry (push skips those), never an empty file that a later
 		// push could mistake for an edit and upload over the real remote content.
-		await this.state.setFile(path, { baseBlobSha: entry.baseBlobSha, size: 0, mtime: 0, lazy: true, remoteSize, mode: entry.mode });
+		await this.state.setFile(path, { baseBlobSha: entry.baseBlobSha, size: 0, mtime: 0, lazy: true, remoteSize, mode: entry.mode, keep: entry.keep });
 		await this.state.flush();
 		await this.files.writeBinary(path, new ArrayBuffer(0));
 		await this.record(path, entry.baseBlobSha, true, remoteSize, entry.mode);
@@ -240,30 +245,15 @@ export class SyncEngine {
 				plan.incoming.push({ path, action });
 			}
 			const remoteLower = new Set([...remote.keys()].map((p) => p.toLowerCase()));
-			for (const path of Object.keys(this.state.state.files)) {
-				if (remote.has(path) || this.excluded(path)) continue;
-				if (remoteLower.has(path.toLowerCase())) {
-					const folded = [...localPaths].filter((p) => p.toLowerCase() === path.toLowerCase());
-					const twinName = [...remote.keys()].find(
-						(p) => p !== path && p.toLowerCase() === path.toLowerCase(),
-					);
-					// Probe with the twin's exact name: on a case-insensitive
-					// filesystem it already resolves to this same file; on a
-					// case-sensitive one it does not exist until the pull fetches
-					// it, and the delete of the old casing is real.
-					const sameFile =
-						folded.length <= 1 &&
-						twinName !== undefined &&
-						!folded.includes(twinName) &&
-						(await this.files.stat(twinName)) !== null;
-					if (sameFile) {
-						// Case-only rename on one physical file: sync only drops
-						// the stale entry.
-						agreedDeleted.add(path);
-						continue;
-					}
+			for (const [path, entry] of Object.entries(this.state.state.files)) {
+				if (remote.has(path) || this.excluded(path) || entry.keep) continue;
+				if (remoteLower.has(path.toLowerCase()) && (await this.isOneFileCaseRename(path, remote, [...localPaths]))) {
+					// Case-only rename on one physical file: sync only drops
+					// the stale entry.
+					agreedDeleted.add(path);
+					continue;
 				}
-				const localSha = await this.localShaIfChanged(path, this.state.state.files[path], false);
+				const localSha = await this.localShaIfChanged(path, entry, false);
 				if (localSha === "missing") {
 					// Deleted on both sides: the sync only drops the entry.
 					agreedDeleted.add(path);
@@ -304,7 +294,7 @@ export class SyncEngine {
 		);
 		for (const path of Object.keys(this.state.state.files)) {
 			const entry = this.state.state.files[path];
-			if (localPaths.has(path) || agreedDeleted.has(path) || this.excluded(path)) continue;
+			if (localPaths.has(path) || agreedDeleted.has(path) || this.excluded(path) || entry.keep) continue;
 			if (!entry.lazy && !uploads.has(path.toLowerCase())) {
 				const twinOnDisk = [...localPaths].find((p) => p.toLowerCase() === path.toLowerCase());
 				// An untracked twin is a case rename of this very file; a twin
@@ -312,6 +302,11 @@ export class SyncEngine {
 				if (twinOnDisk !== undefined && this.state.state.files[twinOnDisk] === undefined) continue;
 			}
 			plan.outgoing.push({ path, action: entry.lazy ? "restore-placeholder" : "deleted" });
+		}
+		for (const [path, entry] of Object.entries(this.state.state.files)) {
+			if (!entry.keep || uploads.has(path.toLowerCase())) continue;
+			// A kept file deleted again before the push just drops out.
+			if (localPaths.has(path) || entry.lazy) plan.outgoing.push({ path, action: "restore-remote" });
 		}
 		return plan;
 	}
@@ -352,13 +347,25 @@ export class SyncEngine {
 		const fingerprints = new Map<string, { mtime: number; size: number; mode?: string }>();
 		const listLocal = async () => (await this.files.listRecursive("")).filter((p) => !this.excluded(p));
 		let listed = await listLocal();
-		// Decided before any upload. A path with a differently-cased twin on
-		// disk is a rename, not a deletion; placeholders are restored below.
-		const listedLower = new Set(listed.map((p) => p.toLowerCase()));
-		const guarded = Object.keys(this.state.state.files).filter(
-			(p) => !listedLower.has(p.toLowerCase()) && !this.excluded(p) && !this.state.state.files[p].lazy,
-		);
+		// Decided before any upload. Placeholders are restored below, kept
+		// files go back to GitHub, and an UNTRACKED twin on disk is a case
+		// rename of this file (the drop loop below applies the same rule).
+		const listedSet = new Set(listed);
+		const guarded = Object.keys(this.state.state.files).filter((p) => {
+			const entry = this.state.state.files[p];
+			if (listedSet.has(p) || this.excluded(p) || entry.lazy || entry.keep) return false;
+			const twin = listed.find((q) => q.toLowerCase() === p.toLowerCase());
+			return twin === undefined || this.state.state.files[twin] !== undefined;
+		});
 		if ((await this.guardDeletions("remote", guarded)) === "keep") {
+			// Placeholders first, in one write: a kill mid-restore leaves lazy
+			// entries, which a push restores and never deletes.
+			const marked: Record<string, FileEntry> = {};
+			for (const p of guarded) {
+				const e = this.state.state.files[p];
+				marked[p] = { baseBlobSha: e.baseBlobSha, size: 0, mtime: 0, lazy: true, remoteSize: e.size, mode: e.mode };
+			}
+			await this.state.setFiles(marked);
 			for (const path of guarded) await this.restoreLocal(path);
 			await this.state.flush();
 			listed = await listLocal();
@@ -439,6 +446,12 @@ export class SyncEngine {
 				continue;
 			}
 			const entry = this.state.state.files[path];
+			if (entry.keep && !entry.lazy) {
+				// Kept, then deleted again here: GitHub already lacks it, so the
+				// entry just drops (a delete would 422 against the base tree).
+				await this.state.removeFile(path);
+				continue;
+			}
 			if (entry.lazy) {
 				// A deleted placeholder must never delete the real remote file;
 				// its content was never on this device to judge. Restore the stub.
@@ -468,6 +481,15 @@ export class SyncEngine {
 			summary.deletedRemote += 1;
 		}
 
+		// Kept files go back by their existing blob: no download, no upload.
+		// ponytail: assumes GitHub still holds the blob (true unless history was purged and gc'd).
+		const readded: string[] = [];
+		for (const [path, entry] of Object.entries(this.state.state.files)) {
+			if (!entry.keep || treeEntries.some((e) => e.path === path)) continue;
+			treeEntries.push({ path, mode: entry.mode ?? "100644", type: "blob", sha: entry.baseBlobSha });
+			readded.push(path);
+		}
+
 		if (treeEntries.length === 0) {
 			if (restoredPlaceholders > 0) await this.state.flush();
 			return summary;
@@ -484,8 +506,12 @@ export class SyncEngine {
 		);
 		await this.gh.updateRef(this.config.branch, commit);
 
+		for (const path of readded) {
+			const { keep: _, ...rest } = this.state.state.files[path];
+			await this.state.setFile(path, rest);
+		}
 		for (const e of treeEntries) {
-			if (e.sha === null) continue;
+			if (e.sha === null || readded.includes(e.path)) continue;
 			const fp = fingerprints.get(e.path) as { mtime: number; size: number; mode?: string };
 			const newEntry: FileEntry = { baseBlobSha: e.sha, size: fp.size, mtime: fp.mtime };
 			if (fp.mode !== undefined && fp.mode !== "100644") newEntry.mode = fp.mode;
@@ -534,12 +560,20 @@ export class SyncEngine {
 		// was. Only clean files vanish (dirty ones are kept or parked, missing
 		// ones are agreement); a case-only rename on GitHub is not a deletion.
 		const guarded: string[] = [];
+		let listedBefore: string[] | null = null;
 		for (const [path, entry] of Object.entries(this.state.state.files)) {
-			if (remote.has(path) || this.excluded(path) || remoteLower.has(path.toLowerCase())) continue;
+			if (remote.has(path) || this.excluded(path) || entry.keep) continue;
+			if (remoteLower.has(path.toLowerCase())) {
+				listedBefore ??= await this.files.listRecursive("");
+				if (await this.isOneFileCaseRename(path, remote, listedBefore)) continue;
+			}
 			if ((await this.localShaIfChanged(path, entry, false)) === "clean") guarded.push(path);
 		}
 		if ((await this.guardDeletions("local", guarded)) === "keep") {
-			for (const path of guarded) await this.keepLocal(path);
+			// One write: a kill mid-way must never persist part of the decision.
+			await this.state.setFiles(
+				Object.fromEntries(guarded.map((p) => [p, { ...this.state.state.files[p], keep: true as const }])),
+			);
 		}
 
 		for (const [path, blob] of remote) {
@@ -550,8 +584,8 @@ export class SyncEngine {
 		}
 
 		let localList: string[] | null = null;
-		for (const path of Object.keys(this.state.state.files)) {
-			if (remote.has(path) || this.excluded(path)) continue;
+		for (const [path, entry] of Object.entries(this.state.state.files)) {
+			if (remote.has(path) || this.excluded(path) || entry.keep) continue;
 			if (remoteLower.has(path.toLowerCase())) {
 				// A case-only rename on GitHub. On a case-insensitive filesystem
 				// the differently-cased twin owns the same physical file, and
@@ -739,20 +773,29 @@ export class SyncEngine {
 		throw new DeletionsDeferred(`${n} deletions ${where} wait for confirmation; run Sync now to review them`);
 	}
 
-	/** Pull-side keep: the file stays, untracked, and the next push uploads it again. */
-	private async keepLocal(path: string): Promise<void> {
-		const entry = this.state.state.files[path];
-		// A placeholder holds no content; git keeps the blob, so fetch it first.
-		if (entry.lazy) await this.files.writeBinary(path, await this.gh.getBlobRaw(entry.baseBlobSha));
-		await this.state.removeFile(path);
+	/**
+	 * A case-only rename on ONE physical file (a case-insensitive filesystem):
+	 * probed with the twin's exact name, which resolves to this same file there,
+	 * and does not exist on a case-sensitive one until a pull fetches it.
+	 */
+	private async isOneFileCaseRename(path: string, remote: Map<string, RemoteBlob>, localPaths: string[]): Promise<boolean> {
+		const folded = localPaths.filter((p) => p.toLowerCase() === path.toLowerCase());
+		const twinName = [...remote.keys()].find((p) => p !== path && p.toLowerCase() === path.toLowerCase());
+		return (
+			folded.length <= 1 &&
+			twinName !== undefined &&
+			!folded.includes(twinName) &&
+			(await this.files.stat(twinName)) !== null
+		);
 	}
 
-	/** Push-side keep: bring the last-synced version back, as a placeholder where a pull would make one. */
+	/** Push-side keep: bring a marked entry's content back, as a placeholder where a pull would make one. */
 	private async restoreLocal(path: string): Promise<void> {
 		const entry = this.state.state.files[path];
-		if (this.isLazyTarget(path, entry.size)) {
+		const size = entry.remoteSize as number;
+		if (this.isLazyTarget(path, size)) {
 			await this.files.writeBinary(path, new ArrayBuffer(0));
-			await this.record(path, entry.baseBlobSha, true, entry.size, entry.mode);
+			await this.record(path, entry.baseBlobSha, true, size, entry.mode);
 			return;
 		}
 		await this.files.writeBinary(path, await this.gh.getBlobRaw(entry.baseBlobSha));
@@ -811,6 +854,9 @@ export class SyncEngine {
 			entry.remoteSize = remoteSize;
 		}
 		if (mode !== undefined && mode !== "100644") entry.mode = mode;
+		// Same blob, same decision: a download, evict or revert of a kept file keeps it marked.
+		const prev = this.state.state.files[path];
+		if (prev?.keep && prev.baseBlobSha === sha) entry.keep = true;
 		await this.state.setFile(path, entry);
 	}
 

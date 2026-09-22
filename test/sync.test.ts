@@ -1600,7 +1600,7 @@ describe("stale empty stubs", () => {
 });
 
 describe("deletion guard", () => {
-	/** Seed the remote with n tracked notes and pull them clean. */
+	/** Seed the remote with n tracked notes (plus extras) and pull them clean. */
 	async function seed(gh: FakeGitHub, engine: SyncEngine, n: number, extra: Record<string, string | Uint8Array> = {}): Promise<void> {
 		const contents: Record<string, string | Uint8Array> = { ...extra };
 		for (let i = 0; i < n; i++) contents[`n/${i}.md`] = `note ${i}`;
@@ -1617,6 +1617,8 @@ describe("deletion guard", () => {
 		return { asked, confirmDeletions };
 	}
 
+	const remoteText = (gh: FakeGitHub, path: string) => new TextDecoder().decode(gh.filesByPath.get(path)?.bytes);
+
 	describe("pull", () => {
 		it("defers with no confirmer, before writing anything", async () => {
 			const { gh, files, state, engine, logs } = makeEngine({ maxDeletions: 2 });
@@ -1624,17 +1626,26 @@ describe("deletion guard", () => {
 			const before = state.state.lastSyncedCommit;
 			await gh.setFiles({ "keep.md": "v2 from a wrong push" });
 			await expect(engine.pull()).rejects.toBeInstanceOf(DeletionsDeferred);
-			expect(files.readText("keep.md")).toBe("v1"); // the incoming change was not applied
+			expect(files.readText("keep.md")).toBe("v1");
 			expect(await files.stat("n/0.md")).not.toBeNull();
-			expect(state.state.files["n/0.md"]).toBeDefined();
 			expect(state.state.lastSyncedCommit).toBe(before);
 			expect(logs.some((l) => l.includes("deferred 3 deletions"))).toBe(true);
+		});
+
+		it("a confirmer's defer also writes nothing, and it was asked once", async () => {
+			const { asked, confirmDeletions } = recorder("defer");
+			const { gh, files, engine } = makeEngine({ maxDeletions: 0, confirmDeletions });
+			await seed(gh, engine, 1, { "keep.md": "v1" });
+			await gh.setFiles({ "keep.md": "v2 changed" });
+			await expect(engine.pull()).rejects.toBeInstanceOf(DeletionsDeferred);
+			expect(asked).toHaveLength(1);
+			expect(files.readText("keep.md")).toBe("v1");
 		});
 
 		it("a deferred pull parks no conflict copies, however often it retries", async () => {
 			const { gh, files, engine } = makeEngine({ maxDeletions: 0 });
 			await seed(gh, engine, 1, { "c.md": "base\n" });
-			files.writeText("c.md", "local\n");
+			files.writeText("c.md", "local edit\n");
 			await gh.setFiles({ "c.md": "remote\n" });
 			await expect(engine.pull()).rejects.toBeInstanceOf(DeletionsDeferred);
 			await expect(engine.pull()).rejects.toBeInstanceOf(DeletionsDeferred);
@@ -1654,7 +1665,7 @@ describe("deletion guard", () => {
 			expect(logs.some((l) => l.includes("deleting 3 files on this device was confirmed"))).toBe(true);
 		});
 
-		it("keep: the files stay untracked, the pull finishes, and the next push restores them", async () => {
+		it("keep: the files stay, the pull finishes, and the next push adds them back without uploading", async () => {
 			const { confirmDeletions } = recorder("keep");
 			const { gh, files, state, engine, logs } = makeEngine({ maxDeletions: 2, confirmDeletions });
 			await seed(gh, engine, 3);
@@ -1662,23 +1673,129 @@ describe("deletion guard", () => {
 			const summary = await engine.pull();
 			expect(summary.deleted).toBe(0);
 			expect(files.readText("n/0.md")).toBe("note 0");
-			expect(state.state.files["n/0.md"]).toBeUndefined();
+			expect(state.state.files["n/0.md"].keep).toBe(true);
 			expect(state.state.lastSyncedCommit).toBe(gh.head);
 			expect(logs.some((l) => l.includes("kept 3 files on this device"))).toBe(true);
-			await engine.push();
-			expect(new TextDecoder().decode(gh.filesByPath.get("n/2.md")?.bytes)).toBe("note 2");
+			const push = await engine.push();
+			expect(gh.createBlobCalls).toBe(0);
+			expect(remoteText(gh, "n/2.md")).toBe("note 2");
+			expect(push.commit).not.toBeNull();
+			expect(state.state.files["n/2.md"].keep).toBeUndefined();
 		});
 
-		it("keep: a kept placeholder gets its real content first, so nothing is lost", async () => {
+		it("keep: a kept placeholder is never downloaded, and GitHub gets it back", async () => {
 			const { confirmDeletions } = recorder("keep");
 			const { gh, files, state, engine } = makeEngine({ maxDeletions: 0, confirmDeletions });
 			await seed(gh, engine, 0, { "a.pdf": new Uint8Array([7, 8, 9]) });
-			expect(state.state.files["a.pdf"].lazy).toBe(true);
+			const fetchesBefore = gh.blobFetches.length;
 			await gh.setFiles({});
 			await engine.pull();
-			expect(files.store.has("a.pdf")).toBe(true);
-			expect([...(files.store.get("a.pdf") as Uint8Array)]).toEqual([7, 8, 9]);
-			expect(state.state.files["a.pdf"]).toBeUndefined();
+			expect(gh.blobFetches.length).toBe(fetchesBefore);
+			expect((await files.stat("a.pdf"))?.size).toBe(0);
+			expect(state.state.files["a.pdf"]).toMatchObject({ lazy: true, keep: true });
+			await engine.push();
+			expect([...(gh.filesByPath.get("a.pdf")?.bytes ?? [])]).toEqual([7, 8, 9]);
+		});
+
+		it("keep: a tracked empty file comes back on GitHub too", async () => {
+			const { confirmDeletions } = recorder("keep");
+			const { gh, engine } = makeEngine({ maxDeletions: 0, confirmDeletions });
+			await seed(gh, engine, 0, { "empty.md": "" });
+			await gh.setFiles({});
+			await engine.pull();
+			await engine.push();
+			expect(gh.filesByPath.has("empty.md")).toBe(true);
+		});
+
+		it("keep is atomic: no saved state ever holds part of the decision", async () => {
+			const { confirmDeletions } = recorder("keep");
+			const { gh, files, engine } = makeEngine({ maxDeletions: 0, confirmDeletions });
+			await seed(gh, engine, 25);
+			const snapshots: number[] = [];
+			const write = files.writeBinary.bind(files);
+			files.writeBinary = async (path: string, data: ArrayBuffer) => {
+				if (path === STATE_PATH) {
+					const saved = JSON.parse(new TextDecoder().decode(data)) as { files: Record<string, { keep?: true }> };
+					snapshots.push(Object.values(saved.files).filter((e) => e.keep).length);
+				}
+				return write(path, data);
+			};
+			await gh.setFiles({});
+			await engine.pull();
+			expect(snapshots.every((k) => k === 0 || k === 25)).toBe(true);
+			expect(snapshots).toContain(25);
+		});
+
+		it("downloading a kept placeholder keeps it marked, so the push still adds it back", async () => {
+			const { confirmDeletions } = recorder("keep");
+			const { gh, state, engine } = makeEngine({ maxDeletions: 0, confirmDeletions });
+			await seed(gh, engine, 0, { "a.pdf": new Uint8Array([7, 8, 9]) });
+			await gh.setFiles({});
+			await engine.pull();
+			await engine.fetchLazy("a.pdf");
+			expect(state.state.files["a.pdf"].keep).toBe(true);
+			await engine.push();
+			expect(gh.filesByPath.has("a.pdf")).toBe(true);
+		});
+
+		it("a kept file is not asked about again by a later pull", async () => {
+			const { asked, confirmDeletions } = recorder("keep");
+			const { gh, files, engine } = makeEngine({ maxDeletions: 0, confirmDeletions });
+			await seed(gh, engine, 1);
+			await gh.setFiles({});
+			await engine.pull();
+			await gh.setFiles({ "other.md": "x" });
+			await engine.pull();
+			expect(asked).toHaveLength(1);
+			expect(files.readText("n/0.md")).toBe("note 0");
+		});
+
+		it("a kept file changed before the push uploads its new content", async () => {
+			const { confirmDeletions } = recorder("keep");
+			const { gh, files, state, engine } = makeEngine({ maxDeletions: 0, confirmDeletions });
+			await seed(gh, engine, 1);
+			await gh.setFiles({});
+			await engine.pull();
+			files.writeText("n/0.md", "edited after keep");
+			await engine.push();
+			expect(remoteText(gh, "n/0.md")).toBe("edited after keep");
+			expect(state.state.files["n/0.md"].keep).toBeUndefined();
+		});
+
+		it("a kept file deleted before the push just drops out, with no delete sent", async () => {
+			const { asked, confirmDeletions } = recorder("keep");
+			const { gh, files, state, engine } = makeEngine({ maxDeletions: 0, confirmDeletions });
+			await seed(gh, engine, 1);
+			await gh.setFiles({});
+			await engine.pull();
+			await files.remove("n/0.md");
+			await engine.push(); // FakeGitHub 422s a delete for a path absent from the base tree
+			expect(state.state.files["n/0.md"]).toBeUndefined();
+			expect(asked).toHaveLength(1);
+		});
+
+		it("preview shows a kept file as going back to GitHub", async () => {
+			const { confirmDeletions } = recorder("keep");
+			const { gh, engine } = makeEngine({ maxDeletions: 0, confirmDeletions });
+			await seed(gh, engine, 1);
+			await gh.setFiles({});
+			await engine.pull();
+			await gh.setFiles({ "other.md": "x" });
+			const plan = await engine.preview();
+			expect(plan.outgoing).toEqual([{ path: "n/0.md", action: "restore-remote" }]);
+			expect(plan.incoming.some((r) => r.path === "n/0.md")).toBe(false);
+		});
+
+		it("preview: a kept file deleted again drops out, and an edited one shows as changed", async () => {
+			const { confirmDeletions } = recorder("keep");
+			const { gh, files, engine } = makeEngine({ maxDeletions: 0, confirmDeletions });
+			await seed(gh, engine, 2);
+			await gh.setFiles({});
+			await engine.pull();
+			await files.remove("n/0.md");
+			files.writeText("n/1.md", "edited after keep");
+			const plan = await engine.preview();
+			expect(plan.outgoing).toEqual([{ path: "n/1.md", action: "modified" }]);
 		});
 
 		it("at or under the threshold nothing is asked", async () => {
@@ -1697,17 +1814,47 @@ describe("deletion guard", () => {
 			await files.remove("n/2.md");
 			await gh.setFiles({});
 			const summary = await engine.pull();
-			expect(summary.deleted).toBe(2); // the clean delete plus the agreement
+			expect(summary.deleted).toBe(2);
 			expect(summary.conflicts).toBe(1);
 		});
 
-		it("a case-only rename on GitHub never counts", async () => {
+		it("a case-only rename on a case-insensitive filesystem never counts", async () => {
 			const { asked, confirmDeletions } = recorder("keep");
 			const { gh, engine } = makeEngine({ maxDeletions: 0, confirmDeletions, files: new CaseFoldMemFiles() });
 			await gh.setFiles({ "Notes/A.md": "x" });
 			await engine.pull();
 			await gh.setFiles({ "notes/a.md": "x" });
 			await engine.pull();
+			expect(asked).toEqual([]);
+		});
+
+		it("on a case-sensitive filesystem the old casing is a real deletion and counts", async () => {
+			const { asked, confirmDeletions } = recorder("delete");
+			const { gh, engine } = makeEngine({ maxDeletions: 0, confirmDeletions });
+			await gh.setFiles({ "A.md": "x" });
+			await engine.pull();
+			await gh.setFiles({ "a.md": "x" });
+			await engine.pull();
+			expect(asked).toEqual([{ direction: "local", paths: ["A.md"] }]);
+		});
+
+		it("a path excluded after it was tracked never counts", async () => {
+			const { asked, confirmDeletions } = recorder("keep");
+			const shared = makeEngine();
+			await seed(shared.gh, shared.engine, 0, { "old/x.md": "x" });
+			const second = new SyncEngine(shared.gh, shared.files, shared.state, () => {}, {
+				branch: "master",
+				textExtensions: DEFAULT_TEXT_EXTENSIONS,
+				maxAutoFetchBytes: 100 * 1048576,
+				maxPushBytes: 30 * 1048576,
+				conflictPolicy: "merge",
+				configDir: ".obsidian",
+				excludedPrefixes: ["old/"],
+				maxDeletions: 0,
+				confirmDeletions,
+			});
+			await shared.gh.setFiles({});
+			await second.pull();
 			expect(asked).toEqual([]);
 		});
 
@@ -1736,6 +1883,17 @@ describe("deletion guard", () => {
 			expect(state.state.files["n/0.md"]).toBeDefined();
 		});
 
+		it("a confirmer's defer also uploads nothing, and it was asked once", async () => {
+			const { asked, confirmDeletions } = recorder("defer");
+			const { gh, files, engine } = makeEngine({ maxDeletions: 0, confirmDeletions });
+			await seed(gh, engine, 1, { "edit.md": "v1" });
+			await files.remove("n/0.md");
+			files.writeText("edit.md", "v2 edited");
+			await expect(engine.push()).rejects.toBeInstanceOf(DeletionsDeferred);
+			expect(asked).toHaveLength(1);
+			expect(gh.createBlobCalls).toBe(0);
+		});
+
 		it("delete: proceeds and removes the files on GitHub", async () => {
 			const { asked, confirmDeletions } = recorder("delete");
 			const { gh, files, engine } = makeEngine({ maxDeletions: 0, confirmDeletions });
@@ -1749,20 +1907,61 @@ describe("deletion guard", () => {
 
 		it("keep: restores the files here and still pushes the other changes", async () => {
 			const { confirmDeletions } = recorder("keep");
-			const { gh, files, state, engine, logs } = makeEngine({ maxDeletions: 0, confirmDeletions });
-			await seed(gh, engine, 2, { "edit.md": "v1", "pic.png": new Uint8Array([1, 2]) });
-			await engine.fetchLazy("pic.png"); // a downloaded binary
-			await files.remove("n/0.md");
-			await files.remove("pic.png");
+			const { gh, files, state, engine, logs } = makeEngine({ maxDeletions: 0, maxAutoFetchBytes: 20, confirmDeletions });
+			await seed(gh, engine, 1, {
+				"edit.md": "v1",
+				"pic.png": new Uint8Array([1, 2]),
+				"long.md": "this note is longer than twenty bytes",
+			});
+			await engine.fetchLazy("pic.png");
+			await engine.fetchLazy("long.md");
+			for (const p of ["n/0.md", "pic.png", "long.md"]) await files.remove(p);
 			files.writeText("edit.md", "v2 edited");
 			const summary = await engine.push();
 			expect(summary.deletedRemote).toBe(0);
 			expect(summary.pushed).toBe(1);
 			expect(files.readText("n/0.md")).toBe("note 0");
-			expect((await files.stat("pic.png"))?.size).toBe(0); // binaries come back as placeholders
-			expect(state.state.files["pic.png"].lazy).toBe(true);
+			expect(state.state.files["pic.png"]).toMatchObject({ lazy: true, remoteSize: 2 });
+			expect(state.state.files["long.md"]).toMatchObject({ lazy: true, remoteSize: 37 });
 			expect(gh.filesByPath.has("n/0.md")).toBe(true);
-			expect(logs.some((l) => l.includes("kept 2 files on GitHub"))).toBe(true);
+			expect(logs.some((l) => l.includes("kept 3 files on GitHub"))).toBe(true);
+		});
+
+		it("an interrupted keep never lets the rest slip under the threshold and get deleted", async () => {
+			const { asked, confirmDeletions } = recorder("keep");
+			const { gh, files, engine } = makeEngine({ maxDeletions: 1, confirmDeletions });
+			await seed(gh, engine, 4);
+			for (let i = 0; i < 4; i++) await files.remove(`n/${i}.md`);
+			gh.failBlobFetchAtIndex = gh.blobFetches.length + 1; // the second restore fails
+			await expect(engine.push()).rejects.toThrow(/network dropped/);
+			const after = recorder("delete");
+			const reloaded = new StateStore(files, STATE_PATH);
+			await reloaded.load(); // what survives on disk, as after an app kill
+			const second = new SyncEngine(gh, files, reloaded, () => {}, {
+				branch: "master",
+				textExtensions: DEFAULT_TEXT_EXTENSIONS,
+				maxAutoFetchBytes: 100 * 1048576,
+				maxPushBytes: 30 * 1048576,
+				conflictPolicy: "merge",
+				configDir: ".obsidian",
+				excludedPrefixes: ["_conflicts/", ".obsidian/plugins/come-gither/", ".git/", ".trash/"],
+				maxDeletions: 1,
+				confirmDeletions: after.confirmDeletions,
+			});
+			const summary = await second.push();
+			expect(summary.deletedRemote).toBe(0);
+			expect(after.asked).toEqual([]);
+			for (let i = 0; i < 4; i++) expect(gh.filesByPath.has(`n/${i}.md`)).toBe(true);
+			expect(asked).toHaveLength(1);
+		});
+
+		it("a deleted placeholder never counts; it is restored", async () => {
+			const { gh, files, engine } = makeEngine({ maxDeletions: 0 });
+			await seed(gh, engine, 0, { "big.bin": new Uint8Array([1, 2, 3]) });
+			await files.remove("big.bin");
+			const summary = await engine.push();
+			expect(summary.deletedRemote).toBe(0);
+			expect((await files.stat("big.bin"))?.size).toBe(0);
 		});
 
 		it("a case-only rename with an edit never counts", async () => {
@@ -1777,11 +1976,19 @@ describe("deletion guard", () => {
 			expect(asked).toEqual([]);
 		});
 
+		it("deleting one of two tracked case twins is a real deletion and counts", async () => {
+			const { asked, confirmDeletions } = recorder("delete");
+			const { gh, files, engine } = makeEngine({ maxDeletions: 0, confirmDeletions });
+			await seed(gh, engine, 0, { "X.md": "upper", "x.md": "lower" });
+			await files.remove("X.md");
+			await engine.push();
+			expect(asked).toEqual([{ direction: "remote", paths: ["X.md"] }]);
+		});
+
 		it("a path excluded after it was tracked never counts", async () => {
 			const { asked, confirmDeletions } = recorder("keep");
 			const shared = makeEngine();
 			await seed(shared.gh, shared.engine, 0, { "old/x.md": "x" });
-			// A second engine over the same state, with "old/" now excluded.
 			const second = new SyncEngine(shared.gh, shared.files, shared.state, () => {}, {
 				branch: "master",
 				textExtensions: DEFAULT_TEXT_EXTENSIONS,
@@ -1804,18 +2011,18 @@ describe("deletion guard", () => {
 			const { gh, files, engine } = makeEngine({ maxDeletions: 0 });
 			await seed(gh, engine, 1, { "edit.md": "v1" });
 			files.writeText("edit.md", "v2 edited");
-			await gh.setFiles({ "edit.md": "v1" }); // n/0.md deleted remotely
+			await gh.setFiles({ "edit.md": "v1" });
 			await expect(engine.sync()).rejects.toBeInstanceOf(DeletionsDeferred);
 			expect(gh.pushedTrees).toEqual([]);
 		});
 
-		it("keep on pull, then the same sync's push uploads the kept files", async () => {
+		it("keep on pull, then the same sync's push adds the kept files back", async () => {
 			const { confirmDeletions } = recorder("keep");
 			const { gh, engine } = makeEngine({ maxDeletions: 0, confirmDeletions });
 			await seed(gh, engine, 1);
 			await gh.setFiles({});
 			const { push } = await engine.sync();
-			expect(push.pushed).toBe(1);
+			expect(push.commit).not.toBeNull();
 			expect(gh.filesByPath.has("n/0.md")).toBe(true);
 		});
 	});

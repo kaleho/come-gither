@@ -1,3 +1,5 @@
+import type { DeletionDecision } from "./sync";
+
 /**
  * Pure helpers for the Obsidian transport and wiring layer. They live here,
  * outside main.ts, so the coverage gate applies to them: the rate-limit retry
@@ -30,14 +32,25 @@ export function clampSyncMinutes(n: number): number {
 	return Math.min(60, Math.max(3, Math.round(n)));
 }
 
-/** A cleared or invalid field is null, never 0: 0 would turn the deletion guard off. */
+/**
+ * A cleared, fractional, or invalid field is null, never 0: only a typed 0
+ * turns the deletion guard off ("0.4" must not round down to off).
+ */
 export function parseDeletionThreshold(value: unknown): number | null {
 	if (typeof value !== "number" && (typeof value !== "string" || value.trim() === "")) return null;
-	const n = Math.round(Number(value));
-	return Number.isFinite(n) && n >= 0 ? n : null;
+	const n = Number(value);
+	return Number.isInteger(n) && n >= 0 ? n : null;
 }
 
 /** The deletion guard setting contract: 0 is off. */
 export function maxDeletionsFor(threshold: number): number {
 	return threshold > 0 ? threshold : Infinity;
+}
+
+/** An unattended run (interval or startup) never asks: nobody is there to answer. */
+export function confirmOrDefer(
+	unattended: boolean,
+	ask: () => Promise<DeletionDecision>,
+): Promise<DeletionDecision> {
+	return unattended ? Promise.resolve("defer") : ask();
 }

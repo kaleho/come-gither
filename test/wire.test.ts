@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cacheBustedUrl, clampSyncMinutes, lowercaseHeaders, maxDeletionsFor, parentDirs, parseDeletionThreshold } from "../src/wire";
+import { cacheBustedUrl, clampSyncMinutes, confirmOrDefer, lowercaseHeaders, maxDeletionsFor, parentDirs, parseDeletionThreshold } from "../src/wire";
 
 describe("cacheBustedUrl", () => {
 	it("appends cb with ? on a bare GET url", () => {
@@ -55,14 +55,14 @@ describe("clampSyncMinutes", () => {
 });
 
 describe("parseDeletionThreshold", () => {
-	it("accepts whole non-negative numbers, rounding", () => {
+	it("accepts whole non-negative numbers", () => {
 		expect(parseDeletionThreshold("25")).toBe(25);
 		expect(parseDeletionThreshold(" 0 ")).toBe(0);
-		expect(parseDeletionThreshold(7.6)).toBe(8);
+		expect(parseDeletionThreshold(7)).toBe(7);
 	});
 
-	it("rejects blank and invalid input, so a cleared field never turns the guard off", () => {
-		for (const v of ["", "   ", null, undefined, "abc", "-3", Number.NaN]) {
+	it("rejects blank, fractional, and invalid input, so only a typed 0 turns the guard off", () => {
+		for (const v of ["", "   ", null, undefined, "abc", "-3", Number.NaN, "0.4", ".3", 7.6, "1e-9"]) {
 			expect(parseDeletionThreshold(v)).toBeNull();
 		}
 	});
@@ -72,5 +72,18 @@ describe("maxDeletionsFor", () => {
 	it("maps 0 to off and passes other thresholds through", () => {
 		expect(maxDeletionsFor(0)).toBe(Infinity);
 		expect(maxDeletionsFor(10)).toBe(10);
+	});
+});
+
+describe("confirmOrDefer", () => {
+	it("defers an unattended run without asking", async () => {
+		let asked = 0;
+		const ask = async () => ((asked += 1), "delete" as const);
+		expect(await confirmOrDefer(true, ask)).toBe("defer");
+		expect(asked).toBe(0);
+	});
+
+	it("asks when someone is there", async () => {
+		expect(await confirmOrDefer(false, async () => "keep")).toBe("keep");
 	});
 });

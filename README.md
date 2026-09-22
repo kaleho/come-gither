@@ -50,7 +50,7 @@ The first sync of a large vault takes a while and is safe to interrupt. Start it
 - A conflict whose GitHub version is larger than the download limit is logged, but no copy lands in `_conflicts/`; resolve it with desktop git.
 - A new empty file is not uploaded until it has content.
 - A binary embedded in a note renders as broken until you open the file directly once.
-- Deletions sync both ways. Deleting a downloaded file locally deletes it on GitHub on the next sync. Deleting a placeholder does not; the placeholder returns. A pull or push that would delete more files than the deletion guard threshold asks first. You choose to delete them or keep them. Keep brings the files back: a pull keeps them on this device and uploads them to GitHub again; a push downloads them to this device again. An automatic or startup sync never asks; it changes nothing and waits for your next **Sync now**.
+- Deletions sync both ways. Deleting a downloaded file locally deletes it on GitHub on the next sync. Deleting a placeholder does not; the placeholder returns. A pull or push that would delete more files than the deletion guard threshold asks first. You choose to delete them or keep them. Keep brings the files back: a pull keeps them on this device and adds them back to GitHub on the same sync; a push restores them on this device (large files and binaries as placeholders). An automatic or startup sync never asks. It deletes nothing and waits for your next **Sync now**.
 
 ## Install
 
