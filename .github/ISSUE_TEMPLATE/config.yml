@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Setup and settings
+    url: https://github.com/kaleho/come-gither#setup
+    about: Token, repository, and settings help is in the README.
