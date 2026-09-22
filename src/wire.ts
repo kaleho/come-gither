@@ -29,3 +29,15 @@ export function clampSyncMinutes(n: number): number {
 	if (!Number.isFinite(n) || n <= 0) return 0;
 	return Math.min(60, Math.max(3, Math.round(n)));
 }
+
+/** A cleared or invalid field is null, never 0: 0 would turn the deletion guard off. */
+export function parseDeletionThreshold(value: unknown): number | null {
+	if (typeof value !== "number" && (typeof value !== "string" || value.trim() === "")) return null;
+	const n = Math.round(Number(value));
+	return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+/** The deletion guard setting contract: 0 is off. */
+export function maxDeletionsFor(threshold: number): number {
+	return threshold > 0 ? threshold : Infinity;
+}

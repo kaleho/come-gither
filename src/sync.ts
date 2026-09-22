@@ -29,9 +29,14 @@ export interface SyncConfig {
 	excludedPrefixes: string[];
 	/** One operation deleting more than this many files needs confirmation (Infinity = off). */
 	maxDeletions: number;
-	/** Asked before an over-threshold deletion; it proceeds only on true. Absent = always abort. */
-	confirmDeletions?: (direction: "local" | "remote", paths: string[]) => Promise<boolean>;
+	/** Asked before an over-threshold deletion. Absent = always defer. */
+	confirmDeletions?: (direction: "local" | "remote", paths: string[]) => Promise<DeletionDecision>;
 }
+
+export type DeletionDecision = "delete" | "keep" | "defer";
+
+/** Thrown when the deletion guard defers: nothing was written, and a later sync asks again. */
+export class DeletionsDeferred extends Error {}
 
 export const DEFAULT_TEXT_EXTENSIONS = [
 	"md", "txt", "json", "css", "js", "html", "csv", "canvas", "svg", "sh", "yml", "yaml",
@@ -345,9 +350,20 @@ export class SyncEngine {
 		const summary: PushSummary = { pushed: 0, deletedRemote: 0, skipped: 0, skippedPaths: [], commit: null };
 		const treeEntries: { path: string; mode: string; type: "blob"; sha: string | null }[] = [];
 		const fingerprints = new Map<string, { mtime: number; size: number; mode?: string }>();
-		const localPaths = new Set(
-			(await this.files.listRecursive("")).filter((p) => !this.excluded(p)),
+		const listLocal = async () => (await this.files.listRecursive("")).filter((p) => !this.excluded(p));
+		let listed = await listLocal();
+		// Decided before any upload. A path with a differently-cased twin on
+		// disk is a rename, not a deletion; placeholders are restored below.
+		const listedLower = new Set(listed.map((p) => p.toLowerCase()));
+		const guarded = Object.keys(this.state.state.files).filter(
+			(p) => !listedLower.has(p.toLowerCase()) && !this.excluded(p) && !this.state.state.files[p].lazy,
 		);
+		if ((await this.guardDeletions("remote", guarded)) === "keep") {
+			for (const path of guarded) await this.restoreLocal(path);
+			await this.state.flush();
+			listed = await listLocal();
+		}
+		const localPaths = new Set(listed);
 
 		for (const path of localPaths) {
 			const entry = this.state.state.files[path];
@@ -457,7 +473,6 @@ export class SyncEngine {
 			return summary;
 		}
 
-		await this.guardDeletions("remote", droppedPaths);
 
 		const base = this.state.state.lastSyncedCommit as string;
 		const { treeSha: baseTree } = await this.gh.getCommit(base);
@@ -513,6 +528,19 @@ export class SyncEngine {
 		}
 		const { treeSha } = await this.gh.getCommit(head);
 		const remote = await this.listRemote(treeSha);
+		const remoteLower = new Set([...remote.keys()].map((p) => p.toLowerCase()));
+
+		// Decided before any write, so a deferred pull leaves the vault as it
+		// was. Only clean files vanish (dirty ones are kept or parked, missing
+		// ones are agreement); a case-only rename on GitHub is not a deletion.
+		const guarded: string[] = [];
+		for (const [path, entry] of Object.entries(this.state.state.files)) {
+			if (remote.has(path) || this.excluded(path) || remoteLower.has(path.toLowerCase())) continue;
+			if ((await this.localShaIfChanged(path, entry, false)) === "clean") guarded.push(path);
+		}
+		if ((await this.guardDeletions("local", guarded)) === "keep") {
+			for (const path of guarded) await this.keepLocal(path);
+		}
 
 		for (const [path, blob] of remote) {
 			if (this.excluded(path)) continue;
@@ -521,9 +549,7 @@ export class SyncEngine {
 			await this.applyRemoteChange(path, blob, entry, summary);
 		}
 
-		const remoteLower = new Set([...remote.keys()].map((p) => p.toLowerCase()));
 		let localList: string[] | null = null;
-		const deleteCandidates: string[] = [];
 		for (const path of Object.keys(this.state.state.files)) {
 			if (remote.has(path) || this.excluded(path)) continue;
 			if (remoteLower.has(path.toLowerCase())) {
@@ -538,18 +564,8 @@ export class SyncEngine {
 					continue;
 				}
 			}
-			deleteCandidates.push(path);
+			await this.applyRemoteDelete(path, summary);
 		}
-		// Guard before the first delete: only clean local files actually vanish
-		// (dirty ones are kept or parked, already-missing ones are agreement).
-		const realDeletes: string[] = [];
-		for (const path of deleteCandidates) {
-			if ((await this.localShaIfChanged(path, this.state.state.files[path], false)) === "clean") {
-				realDeletes.push(path);
-			}
-		}
-		await this.guardDeletions("local", realDeletes);
-		for (const path of deleteCandidates) await this.applyRemoteDelete(path, summary);
 
 		await this.state.setCommit(head);
 		this.log(
@@ -702,18 +718,45 @@ export class SyncEngine {
 
 	/**
 	 * The mass-deletion guard: a wiped device or a wrong remote must never
-	 * silently propagate. Over the threshold, the operation aborts unless the
-	 * wired confirmer (a modal in main.ts) explicitly approves.
+	 * silently propagate. Over the threshold the confirmer decides; with no
+	 * confirmer (or an unattended run) the operation defers before any write.
 	 */
-	private async guardDeletions(direction: "local" | "remote", paths: string[]): Promise<void> {
-		if (paths.length <= this.config.maxDeletions) return;
+	private async guardDeletions(direction: "local" | "remote", paths: string[]): Promise<"delete" | "keep"> {
+		if (paths.length <= this.config.maxDeletions) return "delete";
+		const n = paths.length;
 		const where = direction === "local" ? "on this device" : "on GitHub";
-		this.log("warn", `deletion guard: this sync wants to delete ${paths.length} files ${where}: ${paths.slice(0, 5).join(", ")}${paths.length > 5 ? ", …" : ""}`);
-		if (this.config.confirmDeletions !== undefined && (await this.config.confirmDeletions(direction, paths))) {
-			this.log("info", `deleting ${paths.length} files ${where} was confirmed`);
+		this.log("warn", `deletion guard: ${n} deletions ${where} over threshold ${this.config.maxDeletions}: ${paths.slice(0, 5).join(", ")}${n > 5 ? ", …" : ""}`);
+		const decision = (await this.config.confirmDeletions?.(direction, paths)) ?? "defer";
+		if (decision === "delete") {
+			this.log("info", `deleting ${n} files ${where} was confirmed`);
+			return "delete";
+		}
+		if (decision === "keep") {
+			this.log("info", `kept ${n} files ${where}`);
+			return "keep";
+		}
+		this.log("warn", `deferred ${n} deletions ${where} until a manual sync confirms them`);
+		throw new DeletionsDeferred(`${n} deletions ${where} wait for confirmation; run Sync now to review them`);
+	}
+
+	/** Pull-side keep: the file stays, untracked, and the next push uploads it again. */
+	private async keepLocal(path: string): Promise<void> {
+		const entry = this.state.state.files[path];
+		// A placeholder holds no content; git keeps the blob, so fetch it first.
+		if (entry.lazy) await this.files.writeBinary(path, await this.gh.getBlobRaw(entry.baseBlobSha));
+		await this.state.removeFile(path);
+	}
+
+	/** Push-side keep: bring the last-synced version back, as a placeholder where a pull would make one. */
+	private async restoreLocal(path: string): Promise<void> {
+		const entry = this.state.state.files[path];
+		if (this.isLazyTarget(path, entry.size)) {
+			await this.files.writeBinary(path, new ArrayBuffer(0));
+			await this.record(path, entry.baseBlobSha, true, entry.size, entry.mode);
 			return;
 		}
-		throw new Error(`cancelled: this sync would delete ${paths.length} files ${where}; confirm it or raise the deletion guard threshold`);
+		await this.files.writeBinary(path, await this.gh.getBlobRaw(entry.baseBlobSha));
+		await this.record(path, entry.baseBlobSha, false, undefined, entry.mode);
 	}
 
 	/**

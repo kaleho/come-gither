@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cacheBustedUrl, clampSyncMinutes, lowercaseHeaders, parentDirs } from "../src/wire";
+import { cacheBustedUrl, clampSyncMinutes, lowercaseHeaders, maxDeletionsFor, parentDirs, parseDeletionThreshold } from "../src/wire";
 
 describe("cacheBustedUrl", () => {
 	it("appends cb with ? on a bare GET url", () => {
@@ -51,5 +51,26 @@ describe("clampSyncMinutes", () => {
 		expect(clampSyncMinutes(4.4)).toBe(4);
 		expect(clampSyncMinutes(60)).toBe(60);
 		expect(clampSyncMinutes(999)).toBe(60);
+	});
+});
+
+describe("parseDeletionThreshold", () => {
+	it("accepts whole non-negative numbers, rounding", () => {
+		expect(parseDeletionThreshold("25")).toBe(25);
+		expect(parseDeletionThreshold(" 0 ")).toBe(0);
+		expect(parseDeletionThreshold(7.6)).toBe(8);
+	});
+
+	it("rejects blank and invalid input, so a cleared field never turns the guard off", () => {
+		for (const v of ["", "   ", null, undefined, "abc", "-3", Number.NaN]) {
+			expect(parseDeletionThreshold(v)).toBeNull();
+		}
+	});
+});
+
+describe("maxDeletionsFor", () => {
+	it("maps 0 to off and passes other thresholds through", () => {
+		expect(maxDeletionsFor(0)).toBe(Infinity);
+		expect(maxDeletionsFor(10)).toBe(10);
 	});
 });
