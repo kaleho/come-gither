@@ -1,8 +1,8 @@
 ---
 id: FEAT-0003-063A697B
-status: proposed
+status: in-progress
 created: '2026-09-22T17:26:15+00:00'
-updated: '2026-09-22T17:26:15+00:00'
+updated: '2026-09-22T20:06:42+00:00'
 advances: []
 verifies: []
 derived_from: []
