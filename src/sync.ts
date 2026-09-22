@@ -36,11 +36,14 @@ export interface SyncConfig {
 export type DeletionDecision = "delete" | "keep" | "defer";
 
 /**
- * Thrown when the deletion guard defers: the guarded pull or push wrote
- * nothing, and a later manual sync asks again. In a sync, a pull that ran
- * before a deferred push stays applied.
+ * Thrown when the deletion guard defers: the guarded pull or push changed no
+ * file (a pull may already have dropped stale keep marks), and a later manual
+ * sync asks again. In a sync, a pull that ran before a deferred push stays
+ * applied, and its summary rides along in `pull`.
  */
-export class DeletionsDeferred extends Error {}
+export class DeletionsDeferred extends Error {
+	pull?: PullSummary;
+}
 
 export const DEFAULT_TEXT_EXTENSIONS = [
 	"md", "txt", "json", "css", "js", "html", "csv", "canvas", "svg", "sh", "yml", "yaml",
@@ -54,6 +57,7 @@ export interface PullSummary {
 	deleted: number;
 	merged: number;
 	conflicts: number;
+	kept: number; // guarded files the user kept; the push adds them back
 }
 
 export interface PushSummary {
@@ -62,6 +66,8 @@ export interface PushSummary {
 	skipped: number;
 	skippedPaths: string[];
 	commit: string | null;
+	readded: number; // kept files added back to GitHub by blob
+	restored: number; // guarded files a push-side Keep brought back here
 }
 
 export type IncomingAction =
@@ -97,6 +103,11 @@ interface RemoteBlob {
 	sha: string;
 	size: number;
 	mode: string;
+}
+
+/** A log-sized list: the first five paths, then an ellipsis. */
+function firstFive(paths: string[]): string {
+	return paths.slice(0, 5).join(", ") + (paths.length > 5 ? ", …" : "");
 }
 
 export async function gitBlobSha1(data: ArrayBuffer): Promise<string> {
@@ -342,7 +353,7 @@ export class SyncEngine {
 	}
 
 	private async doPush(): Promise<PushSummary> {
-		const summary: PushSummary = { pushed: 0, deletedRemote: 0, skipped: 0, skippedPaths: [], commit: null };
+		const summary: PushSummary = { pushed: 0, deletedRemote: 0, skipped: 0, skippedPaths: [], commit: null, readded: 0, restored: 0 };
 		const treeEntries: { path: string; mode: string; type: "blob"; sha: string | null }[] = [];
 		const fingerprints = new Map<string, { mtime: number; size: number; mode?: string }>();
 		const listLocal = async () => (await this.files.listRecursive("")).filter((p) => !this.excluded(p));
@@ -367,8 +378,11 @@ export class SyncEngine {
 				marked[p] = { baseBlobSha: e.baseBlobSha, size: 0, mtime: 0, lazy: true, remoteSize: e.size, mode: e.mode };
 			}
 			await this.state.setFiles(marked);
-			for (const path of guarded) await this.restoreLocal(path);
+			let placeholders = 0;
+			for (const path of guarded) if (await this.restoreLocal(path)) placeholders += 1;
 			await this.state.flush();
+			summary.restored = guarded.length;
+			this.log("info", `restored ${guarded.length} files here (${placeholders} as placeholders)`);
 			listed = await listLocal();
 		}
 		const localPaths = new Set(listed);
@@ -490,26 +504,28 @@ export class SyncEngine {
 			treeEntries.push({ path, mode: entry.mode ?? "100644", type: "blob", sha: entry.baseBlobSha });
 			readded.push(path);
 		}
+		summary.readded = readded.length;
 
 		if (treeEntries.length === 0) {
 			if (restoredPlaceholders > 0) await this.state.flush();
 			return summary;
 		}
 
-
 		const base = this.state.state.lastSyncedCommit as string;
 		const { treeSha: baseTree } = await this.gh.getCommit(base);
 		const newTree = await this.gh.createTree(baseTree, treeEntries);
 		const commit = await this.gh.createCommit(
-			`come-gither: sync (${summary.pushed} changed, ${summary.deletedRemote} deleted)`,
+			`come-gither: sync (${summary.pushed} changed, ${summary.deletedRemote} deleted, ${summary.readded} kept)`,
 			newTree,
 			[base],
 		);
 		await this.gh.updateRef(this.config.branch, commit);
 
-		for (const path of readded) {
-			const { keep: _, ...rest } = this.state.state.files[path];
-			await this.state.setFile(path, rest);
+		if (readded.length > 0) {
+			await this.state.setFiles(
+				Object.fromEntries(readded.map((p) => [p, (({ keep: _, ...rest }) => rest)(this.state.state.files[p])])),
+			);
+			this.log("info", `re-added ${readded.length} kept files to GitHub by blob: ${firstFive(readded)}`);
 		}
 		for (const e of treeEntries) {
 			if (e.sha === null || readded.includes(e.path)) continue;
@@ -530,6 +546,7 @@ export class SyncEngine {
 		try {
 			return { pull, push: await this.doPush() };
 		} catch (e) {
+			if (e instanceof DeletionsDeferred) e.pull = pull;
 			if (e instanceof GitHubError && e.kind === "not-fast-forward" && attempt < 3) {
 				this.log("warn", "the branch moved during the push; pulling again and retrying");
 				return this.doSync(attempt + 1);
@@ -547,6 +564,7 @@ export class SyncEngine {
 			deleted: 0,
 			merged: 0,
 			conflicts: 0,
+			kept: 0,
 		};
 		const head = await this.gh.getRef(this.config.branch);
 		if (head === this.state.state.lastSyncedCommit) {
@@ -559,9 +577,11 @@ export class SyncEngine {
 
 		// `keep` means "absent on GitHub": a path GitHub has again drops the
 		// mark, or a later push would re-add the old blob over the new one.
-		const back = Object.entries(this.state.state.files).filter(([p, e]) => e.keep && remote.has(p));
+		// A case twin counts: re-adding next to it would commit a collision.
+		const back = Object.entries(this.state.state.files).filter(([p, e]) => e.keep && remoteByLower.has(p.toLowerCase()));
 		if (back.length > 0) {
 			await this.state.setFiles(Object.fromEntries(back.map(([p, { keep: _, ...rest }]) => [p, rest])));
+			this.log("info", `${back.length} kept files are on GitHub again; no longer marked kept`);
 		}
 
 		// Decided before any write, so a deferred pull leaves the vault as it
@@ -581,6 +601,7 @@ export class SyncEngine {
 			await this.state.setFiles(
 				Object.fromEntries(guarded.map((p) => [p, { ...this.state.state.files[p], keep: true as const }])),
 			);
+			summary.kept = guarded.length;
 		}
 
 		for (const [path, blob] of remote) {
@@ -699,6 +720,7 @@ export class SyncEngine {
 		if (entry && localSha === "missing") {
 			// Deleted here, changed on GitHub: the entry must describe GitHub's
 			// version, or a later Keep would restore the stale one as "synced".
+			this.log("info", `${path}: deleted here, changed on GitHub; now tracking GitHub's version`);
 			await this.state.setFile(
 				path,
 				entry.lazy ? { ...entry, baseBlobSha: blob.sha, remoteSize: blob.size } : { ...entry, baseBlobSha: blob.sha, size: blob.size },
@@ -768,24 +790,30 @@ export class SyncEngine {
 	/**
 	 * The mass-deletion guard: a wiped device or a wrong remote must never
 	 * silently propagate. Over the threshold the confirmer decides; with no
-	 * confirmer (or an unattended run) the operation defers before any write.
+	 * confirmer (or an unattended run) the operation defers before it changes
+	 * any file.
 	 */
 	private async guardDeletions(direction: "local" | "remote", paths: string[]): Promise<"delete" | "keep"> {
 		if (paths.length <= this.config.maxDeletions) return "delete";
 		const n = paths.length;
 		const where = direction === "local" ? "on this device" : "on GitHub";
-		this.log("warn", `deletion guard: ${n} deletions ${where} over threshold ${this.config.maxDeletions}: ${paths.slice(0, 5).join(", ")}${n > 5 ? ", …" : ""}`);
+		this.log("warn", `deletion guard: ${n} deletions ${where} over threshold ${this.config.maxDeletions}: ${firstFive(paths)}`);
 		const decision = (await this.config.confirmDeletions?.(direction, paths)) ?? "defer";
 		if (decision === "delete") {
 			this.log("info", `deleting ${n} files ${where} was confirmed`);
 			return "delete";
 		}
 		if (decision === "keep") {
-			this.log("info", `kept ${n} files ${where}`);
+			this.log(
+				"info",
+				direction === "local"
+					? `kept ${n} files on this device; the push adds them back to GitHub`
+					: `kept ${n} files on GitHub; restoring them on this device`,
+			);
 			return "keep";
 		}
 		this.log("warn", `deferred ${n} deletions ${where} until a manual sync confirms them`);
-		throw new DeletionsDeferred(`${n} deletions ${where} wait for confirmation; run Sync now to review them`);
+		throw new DeletionsDeferred(`sync paused: ${n} files would be deleted ${where}; run Sync now to review them`);
 	}
 
 	/**
@@ -804,17 +832,21 @@ export class SyncEngine {
 		);
 	}
 
-	/** Push-side keep: bring a marked entry's content back, as a placeholder where a pull would make one. */
-	private async restoreLocal(path: string): Promise<void> {
+	/**
+	 * Push-side keep: bring a marked entry's content back, as a placeholder
+	 * where a pull would make one. True when it came back as a placeholder.
+	 */
+	private async restoreLocal(path: string): Promise<boolean> {
 		const entry = this.state.state.files[path];
 		const size = entry.remoteSize as number;
 		if (this.isLazyTarget(path, size)) {
 			await this.files.writeBinary(path, new ArrayBuffer(0));
 			await this.record(path, entry.baseBlobSha, true, size, entry.mode);
-			return;
+			return true;
 		}
 		await this.files.writeBinary(path, await this.gh.getBlobRaw(entry.baseBlobSha));
 		await this.record(path, entry.baseBlobSha, false, undefined, entry.mode);
+		return false;
 	}
 
 	/**

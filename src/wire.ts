@@ -1,4 +1,4 @@
-import type { DeletionDecision } from "./sync";
+import type { DeletionDecision, PullSummary, PushSummary } from "./sync";
 
 /**
  * Pure helpers for the Obsidian transport and wiring layer. They live here,
@@ -53,4 +53,26 @@ export function confirmOrDefer(
 	ask: () => Promise<DeletionDecision>,
 ): Promise<DeletionDecision> {
 	return unattended ? Promise.resolve("defer") : ask();
+}
+
+/** The parts of a sync's completion Notice; "already up to date" only when nothing moved. */
+export function syncParts(pull: PullSummary, push: PushSummary | null): string[] {
+	const parts: string[] = [];
+	if (pull.upToDate && (push === null || push.commit === null)) parts.push("already up to date");
+	if (pull.fetched) parts.push(`${pull.fetched} fetched`);
+	if (pull.adopted) parts.push(`${pull.adopted} adopted`);
+	if (pull.placeholders) parts.push(`${pull.placeholders} placeholders`);
+	if (pull.merged) parts.push(`${pull.merged} merged`);
+	if (pull.deleted) parts.push(`${pull.deleted} deleted here`);
+	if (pull.conflicts) parts.push(`${pull.conflicts} conflicts (see _conflicts/ and the log)`);
+	if (pull.kept) parts.push(`${pull.kept} kept here`);
+	if (push?.pushed) parts.push(`${push.pushed} pushed`);
+	if (push?.deletedRemote) parts.push(`${push.deletedRemote} deleted on GitHub`);
+	if (push?.readded) parts.push(`${push.readded} kept files back on GitHub`);
+	if (push?.restored) parts.push(`${push.restored} restored here`);
+	if (push && push.skipped > 0) {
+		const names = push.skippedPaths.slice(0, 2).join(", ");
+		parts.push(`${push.skipped} skipped (${names}${push.skippedPaths.length > 2 ? ", …" : ""})`);
+	}
+	return parts;
 }

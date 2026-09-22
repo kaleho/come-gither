@@ -26,6 +26,7 @@ import {
 	maxDeletionsFor,
 	parentDirs,
 	parseDeletionThreshold,
+	syncParts,
 } from "./wire";
 
 interface ComeGitherSettings {
@@ -159,7 +160,7 @@ class ConfirmFetchModal extends Modal {
 }
 
 class ConfirmDeletionsModal extends Modal {
-	// Escape, a tap outside, or Keep all keep the files: the safe answer.
+	// Escape, a tap outside, or "Keep them" all keep the files: the safe answer.
 	private decision: DeletionDecision = "keep";
 
 	constructor(
@@ -409,6 +410,7 @@ export default class ComeGitherPlugin extends Plugin {
 		// lazily on next use, after the retired engine's queue drains. Two
 		// engines can never run over the same files and state.
 		this.rebaselineNoticed = false; // a settings change opens a new episode
+		this.deferNoticed = false;
 		const old = this.sessionPromise;
 		if (old !== null) {
 			this.sessionPromise = null;
@@ -558,20 +560,7 @@ export default class ComeGitherPlugin extends Plugin {
 				({ pull, push } = await engine.sync());
 			}
 			await this.refreshLazyIndex();
-			const parts: string[] = [];
-			if (pull.upToDate && (push === null || push.commit === null)) parts.push("already up to date");
-			if (pull.fetched) parts.push(`${pull.fetched} fetched`);
-			if (pull.adopted) parts.push(`${pull.adopted} adopted`);
-			if (pull.placeholders) parts.push(`${pull.placeholders} placeholders`);
-			if (pull.merged) parts.push(`${pull.merged} merged`);
-			if (pull.deleted) parts.push(`${pull.deleted} deleted here`);
-			if (pull.conflicts) parts.push(`${pull.conflicts} conflicts (see _conflicts/ and the log)`);
-			if (push?.pushed) parts.push(`${push.pushed} pushed`);
-			if (push?.deletedRemote) parts.push(`${push.deletedRemote} deleted on GitHub`);
-			if (push && push.skipped > 0) {
-				const names = push.skippedPaths.slice(0, 2).join(", ");
-				parts.push(`${push.skipped} skipped (${names}${push.skippedPaths.length > 2 ? ", …" : ""})`);
-			}
+			const parts = syncParts(pull, push);
 			// A quiet run reports only real work; "already up to date" every
 			// interval tick would be noise.
 			const happened = parts.some((p) => p !== "already up to date");
@@ -585,17 +574,22 @@ export default class ComeGitherPlugin extends Plugin {
 				// asks. A pull before a deferred push did apply, so the lazy index
 				// still needs its refresh. One Notice per episode, not per tick.
 				await this.refreshLazyIndex();
-				if (!this.deferNoticed) {
+				// What a pull before the deferred push did still gets reported.
+				const done = e.pull ? syncParts(e.pull, null).filter((p) => p !== "already up to date") : [];
+				if (!this.deferNoticed || done.length > 0) {
 					this.deferNoticed = true;
-					new Notice(`Come Gither: ${e.message}.`);
+					new Notice(`Come Gither: ${[e.message, ...done].join("; ")}.`);
 				}
-				this.setStatus("waiting for you");
+				this.setStatus("paused: run Sync now");
 				return;
 			}
 			const message = e instanceof Error ? e.message : String(e);
 			this.logger.log("error", `sync failed: ${message}`);
 			new Notice(`Come Gither: sync failed — ${message}`);
 			this.setStatus("error");
+			this.deferNoticed = false; // a failure ends the paused episode
+			// A retried pull may have added placeholders before the failure.
+			await this.refreshLazyIndex().catch(() => {});
 		} finally {
 			await this.logger.flush();
 			this.syncing = false;
@@ -798,7 +792,7 @@ class ComeGitherSettingTab extends PluginSettingTab {
 			{ name: "Pull when Obsidian starts", control: { type: "toggle", key: "pullOnStart" } },
 			{
 				name: "Deletion guard threshold",
-				desc: "A pull or push that would delete more files than this asks first. 0 turns the guard off.",
+				desc: "A pull or push that would delete more files than this asks first; automatic and startup syncs pause instead until you run Sync now. 0 turns the guard off.",
 				control: { type: "number", key: "deletionGuardThreshold", min: 0, defaultValue: DEFAULT_SETTINGS.deletionGuardThreshold },
 			},
 		];
@@ -897,7 +891,7 @@ class ComeGitherSettingTab extends PluginSettingTab {
 			.addToggle((t) => t.setValue(s.pullOnStart).onChange((v) => ((s.pullOnStart = v), save())));
 		new Setting(containerEl)
 			.setName("Deletion guard threshold")
-			.setDesc("A pull or push that would delete more files than this asks first. 0 turns the guard off.")
+			.setDesc("A pull or push that would delete more files than this asks first; automatic and startup syncs pause instead until you run Sync now. 0 turns the guard off.")
 			.addText((t) =>
 				t.setValue(String(s.deletionGuardThreshold)).onChange((v) => {
 					const n = parseDeletionThreshold(v);

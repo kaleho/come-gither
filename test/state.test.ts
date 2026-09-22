@@ -235,18 +235,16 @@ describe("StateStore round trip", () => {
 });
 
 describe("StateStore setFiles", () => {
-	it("applies sets and removals, then persists them in exactly one write", async () => {
+	it("applies many entries, then persists them in exactly one write", async () => {
 		const files = new MemFiles();
 		const store = new StateStore(files, "s.json");
 		await store.load();
-		await store.setFile("gone.md", { baseBlobSha: "a", size: 1, mtime: 1 });
 		files.writes.length = 0;
-		const entries: Record<string, FileEntry | null> = { "gone.md": null };
+		const entries: Record<string, FileEntry> = {};
 		for (let i = 0; i < 25; i++) entries[`n/${i}.md`] = { baseBlobSha: `s${i}`, size: 1, mtime: 1 };
 		await store.setFiles(entries);
 		expect(files.writes).toEqual(["s.json"]);
 		const saved = JSON.parse(files.readText("s.json")) as { files: Record<string, FileEntry> };
 		expect(Object.keys(saved.files)).toHaveLength(25);
-		expect(saved.files["gone.md"]).toBeUndefined();
 	});
 });

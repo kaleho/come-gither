@@ -96,11 +96,8 @@ export class StateStore {
 	}
 
 	/** Many changes in one write: a kill mid-way can never persist part of them. */
-	async setFiles(changes: Record<string, FileEntry | null>): Promise<void> {
-		for (const [path, entry] of Object.entries(changes)) {
-			if (entry === null) delete this.state.files[path];
-			else this.state.files[path] = entry;
-		}
+	async setFiles(entries: Record<string, FileEntry>): Promise<void> {
+		Object.assign(this.state.files, entries);
 		await this.flush();
 	}
 

@@ -1,5 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { cacheBustedUrl, clampSyncMinutes, confirmOrDefer, lowercaseHeaders, maxDeletionsFor, parentDirs, parseDeletionThreshold } from "../src/wire";
+import {
+	cacheBustedUrl,
+	clampSyncMinutes,
+	confirmOrDefer,
+	lowercaseHeaders,
+	maxDeletionsFor,
+	parentDirs,
+	parseDeletionThreshold,
+	syncParts,
+} from "../src/wire";
+import type { PullSummary, PushSummary } from "../src/sync";
 
 describe("cacheBustedUrl", () => {
 	it("appends cb with ? on a bare GET url", () => {
@@ -85,5 +95,38 @@ describe("confirmOrDefer", () => {
 
 	it("asks when someone is there", async () => {
 		expect(await confirmOrDefer(false, async () => "keep")).toBe("keep");
+	});
+});
+
+describe("syncParts", () => {
+	const pull = (o: Partial<PullSummary> = {}): PullSummary => ({
+		upToDate: false, fetched: 0, placeholders: 0, adopted: 0, deleted: 0, merged: 0, conflicts: 0, kept: 0, ...o,
+	});
+	const push = (o: Partial<PushSummary> = {}): PushSummary => ({
+		pushed: 0, deletedRemote: 0, skipped: 0, skippedPaths: [], commit: null, readded: 0, restored: 0, ...o,
+	});
+
+	it("says up to date only when nothing moved", () => {
+		expect(syncParts(pull({ upToDate: true }), push())).toEqual(["already up to date"]);
+		expect(syncParts(pull({ upToDate: true }), null)).toEqual(["already up to date"]);
+		expect(syncParts(pull({ upToDate: true }), push({ commit: "c" }))).toEqual([]);
+	});
+
+	it("reports every count, including what Keep brought back", () => {
+		expect(
+			syncParts(
+				pull({ fetched: 1, adopted: 2, placeholders: 3, merged: 4, deleted: 5, conflicts: 6, kept: 7 }),
+				push({ pushed: 8, deletedRemote: 9, readded: 10, restored: 11, commit: "c" }),
+			),
+		).toEqual([
+			"1 fetched", "2 adopted", "3 placeholders", "4 merged", "5 deleted here",
+			"6 conflicts (see _conflicts/ and the log)", "7 kept here",
+			"8 pushed", "9 deleted on GitHub", "10 kept files back on GitHub", "11 restored here",
+		]);
+	});
+
+	it("names at most two skipped files", () => {
+		expect(syncParts(pull(), push({ skipped: 3, skippedPaths: ["a", "b", "c"] }))).toEqual(["3 skipped (a, b, …)"]);
+		expect(syncParts(pull(), push({ skipped: 1, skippedPaths: ["a"] }))).toEqual(["1 skipped (a)"]);
 	});
 });

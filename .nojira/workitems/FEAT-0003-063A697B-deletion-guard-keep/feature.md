@@ -19,7 +19,7 @@ The 2026-09-22 bug hunt of PR #32 (57 raw findings, 14 lanes) kept two Highs on 
 
 ## Acceptance
 
-- The decision is delete / keep / defer. Keep: pull keeps the files and untracks them (they upload again on push); push restores the files locally from their last-synced blobs. Neither wedges a later sync.
+- The decision is delete / keep / defer. Keep (pull): the files stay tracked with a `keep` mark, written in one state write, and the same sync's push re-adds each by its existing blob (no download, no upload); the mark drops as soon as GitHub has the path, in any casing. Keep (push): the entries are marked as placeholders in one write, then restored here (large files and binaries as placeholders). Neither wedges a later sync, and an interrupted Keep never lets the rest fall under the threshold.
 - The guard decides before any write in both directions; defer (no confirmer, or an unattended run) changes nothing.
 - Unattended runs (auto-sync interval, startup pull) never open the modal; they defer with one Notice until a manual sync.
 - The modal text covers moves and other-device deletions; Escape keeps.

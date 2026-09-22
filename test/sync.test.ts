@@ -258,7 +258,7 @@ describe("push", () => {
 		await gh.setFiles({ "a.md": "one" });
 		await engine.pull();
 		const summary = await engine.push();
-		expect(summary).toEqual({ pushed: 0, deletedRemote: 0, skipped: 0, skippedPaths: [], commit: null });
+		expect(summary).toEqual({ pushed: 0, deletedRemote: 0, skipped: 0, skippedPaths: [], commit: null, readded: 0, restored: 0 });
 		expect(gh.pushedTrees).toEqual([]);
 	});
 
@@ -1672,6 +1672,7 @@ describe("deletion guard", () => {
 			await gh.setFiles({});
 			const summary = await engine.pull();
 			expect(summary.deleted).toBe(0);
+			expect(summary.kept).toBe(3);
 			expect(files.readText("n/0.md")).toBe("note 0");
 			expect(state.state.files["n/0.md"].keep).toBe(true);
 			expect(state.state.lastSyncedCommit).toBe(gh.head);
@@ -1680,6 +1681,9 @@ describe("deletion guard", () => {
 			expect(gh.createBlobCalls).toBe(0);
 			expect(remoteText(gh, "n/2.md")).toBe("note 2");
 			expect(push.commit).not.toBeNull();
+			expect(push.readded).toBe(3);
+			expect(gh.pushedCommits.get(push.commit as string)?.message).toBe("come-gither: sync (0 changed, 0 deleted, 3 kept)");
+			expect(logs.some((l) => l.includes("re-added 3 kept files to GitHub by blob"))).toBe(true);
 			expect(state.state.files["n/2.md"].keep).toBeUndefined();
 		});
 
@@ -1750,6 +1754,19 @@ describe("deletion guard", () => {
 			expect(state.state.files["a.pdf"].keep).toBeUndefined();
 			await engine.push();
 			expect([...(gh.filesByPath.get("a.pdf")?.bytes ?? [])]).toEqual([9, 9, 9, 9]);
+		});
+
+		it("a kept file loses its mark when GitHub gains a case twin of it, so no collision is re-added", async () => {
+			const { confirmDeletions } = recorder("keep");
+			const { gh, state, engine, logs } = makeEngine({ maxDeletions: 0, confirmDeletions, files: new CaseFoldMemFiles() });
+			await seed(gh, engine, 0, { "A.md": "upper" });
+			await gh.setFiles({});
+			await engine.pull();
+			await gh.setFiles({ "a.md": "lower" });
+			await engine.pull();
+			expect(state.state.files["A.md"]?.keep).toBeUndefined();
+			expect(logs.some((l) => l.includes("no longer marked kept"))).toBe(true);
+			expect((await engine.push()).readded).toBe(0);
 		});
 
 		it("a mark cleared by GitHub's copy lets a later GitHub deletion reach the guard", async () => {
@@ -1928,7 +1945,7 @@ describe("deletion guard", () => {
 			const { gh, engine, logs } = makeEngine({ maxDeletions: 2 });
 			await seed(gh, engine, 7);
 			await gh.setFiles({});
-			await expect(engine.pull()).rejects.toThrow(/7 deletions/);
+			await expect(engine.pull()).rejects.toThrow(/sync paused: 7 files would be deleted on this device/);
 			const warn = logs.find((l) => l.includes("deletion guard")) as string;
 			expect(warn).toContain("threshold 2");
 			expect(warn).toContain("n/4.md, …");
@@ -1986,6 +2003,8 @@ describe("deletion guard", () => {
 			const summary = await engine.push();
 			expect(summary.deletedRemote).toBe(0);
 			expect(summary.pushed).toBe(1);
+			expect(summary.restored).toBe(3);
+			expect(logs.some((l) => l.includes("restored 3 files here (2 as placeholders)"))).toBe(true);
 			expect(files.readText("n/0.md")).toBe("note 0");
 			expect(state.state.files["pic.png"]).toMatchObject({ lazy: true, remoteSize: 2 });
 			expect(state.state.files["long.md"]).toMatchObject({ lazy: true, remoteSize: 37 });
@@ -2108,6 +2127,16 @@ describe("deletion guard", () => {
 	});
 
 	describe("sync", () => {
+		it("a deferred push still carries the pull that already applied", async () => {
+			const { gh, files, engine } = makeEngine({ maxDeletions: 0 });
+			await seed(gh, engine, 1, { "new.md": "x" });
+			await files.remove("n/0.md");
+			await gh.setFiles({ "n/0.md": "note 0", "new.md": "x", "incoming.md": "fresh" });
+			const err = await engine.sync().catch((e: unknown) => e);
+			expect(err).toBeInstanceOf(DeletionsDeferred);
+			expect((err as DeletionsDeferred).pull?.fetched).toBe(1);
+		});
+
 		it("a deferred pull never reaches the push", async () => {
 			const { gh, files, engine } = makeEngine({ maxDeletions: 0 });
 			await seed(gh, engine, 1, { "edit.md": "v1" });
