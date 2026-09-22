@@ -4,3 +4,4 @@ coverage/
 data.json
 .DS_Store
 .serena/
+.nojira/index.db
