@@ -7,6 +7,7 @@ export interface FileEntry {
 	lazy?: true;
 	remoteSize?: number; // set on lazy entries: the real file's size on GitHub
 	mode?: string; // git mode when not the default "100644" (e.g. "100755")
+	keep?: true; // absent on GitHub by the user's Keep; the next push adds it back by baseBlobSha
 }
 
 export interface SyncState {
@@ -92,6 +93,12 @@ export class StateStore {
 	async setFile(path: string, entry: FileEntry): Promise<void> {
 		this.state.files[path] = entry;
 		await this.bump();
+	}
+
+	/** Many changes in one write: a kill mid-way can never persist part of them. */
+	async setFiles(entries: Record<string, FileEntry>): Promise<void> {
+		Object.assign(this.state.files, entries);
+		await this.flush();
 	}
 
 	async removeFile(path: string): Promise<void> {

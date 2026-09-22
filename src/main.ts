@@ -16,9 +16,18 @@ import { RingLogger } from "./log";
 import type { SettingDefinitionItem } from "obsidian";
 import type { Files, Http, HttpRequest, HttpResponse } from "./ports";
 import { StateStore } from "./state";
-import { DEFAULT_TEXT_EXTENSIONS, SyncEngine } from "./sync";
-import type { PullSummary, PushSummary, SyncPlan } from "./sync";
-import { cacheBustedUrl, clampSyncMinutes, lowercaseHeaders, parentDirs } from "./wire";
+import { DEFAULT_TEXT_EXTENSIONS, DeletionsDeferred, SyncEngine } from "./sync";
+import type { DeletionDecision, PullSummary, PushSummary, SyncPlan } from "./sync";
+import {
+	cacheBustedUrl,
+	clampSyncMinutes,
+	confirmOrDefer,
+	lowercaseHeaders,
+	maxDeletionsFor,
+	parentDirs,
+	parseDeletionThreshold,
+	syncParts,
+} from "./wire";
 
 interface ComeGitherSettings {
 	owner: string;
@@ -30,7 +39,7 @@ interface ComeGitherSettings {
 	maxAutoFetchMB: number;
 	autoSyncMinutes: number; // 0 = off; otherwise clamped to 3..60
 	pullOnStart: boolean;
-	deletionGuardThreshold: number; // 0 = off; a sync deleting more files asks first
+	deletionGuardThreshold: number; // 0 = off; a pull or push deleting more files asks first
 }
 
 const DEFAULT_SETTINGS: ComeGitherSettings = {
@@ -151,38 +160,48 @@ class ConfirmFetchModal extends Modal {
 }
 
 class ConfirmDeletionsModal extends Modal {
-	private confirmed = false;
+	// Escape, a tap outside, or "Keep them" all keep the files: the safe answer.
+	private decision: DeletionDecision = "keep";
 
 	constructor(
 		app: App,
 		private direction: "local" | "remote",
 		private paths: string[],
-		private onDone: (confirmed: boolean) => void,
+		private onDone: (decision: DeletionDecision) => void,
 	) {
 		super(app);
 	}
 
 	onOpen(): void {
-		const where = this.direction === "local" ? "on this device" : "on GitHub";
+		const n = this.paths.length;
 		this.contentEl.createEl("p", {
-			text: `This sync wants to delete ${this.paths.length} files ${where}. If you did not delete them yourself, cancel and check the sync preview.`,
+			text:
+				this.direction === "local"
+					? `GitHub no longer has ${n} files that are on this device. They were deleted or moved on GitHub or on another device.`
+					: `${n} files are missing on this device. This sync would delete them on GitHub.`,
+		});
+		this.contentEl.createEl("p", {
+			text:
+				this.direction === "local"
+					? "Delete them here too, or keep them? Kept files go back to GitHub on this sync."
+					: "Delete them on GitHub, or keep them? Kept files come back to this device; large files and binaries come back as placeholders.",
 		});
 		const list = this.contentEl.createEl("ul");
 		for (const path of this.paths.slice(0, 20)) list.createEl("li", { text: path });
-		if (this.paths.length > 20) list.createEl("li", { text: `… and ${this.paths.length - 20} more` });
+		if (n > 20) list.createEl("li", { text: `… and ${n - 20} more` });
 		new Setting(this.contentEl)
 			.addButton((b) =>
-				b.setButtonText(`Delete ${this.paths.length} files`).setWarning().onClick(() => {
-					this.confirmed = true;
+				b.setButtonText(`Delete ${n} files`).setWarning().onClick(() => {
+					this.decision = "delete";
 					this.close();
 				}),
 			)
-			.addButton((b) => b.setButtonText("Cancel").setCta().onClick(() => this.close()));
+			.addButton((b) => b.setButtonText("Keep them").setCta().onClick(() => this.close()));
 	}
 
 	onClose(): void {
 		this.contentEl.empty();
-		this.onDone(this.confirmed);
+		this.onDone(this.decision);
 	}
 }
 
@@ -205,6 +224,7 @@ const OUTGOING_LABELS: Record<string, string> = {
 	"restore-placeholder": "Deleted placeholder will be restored",
 	"skip-oversize": "Skipped: too large to push",
 	"skip-placeholder": "Skipped: modified placeholder",
+	"restore-remote": "Kept: goes back to GitHub",
 };
 const REVERTIBLE = new Set(["new", "modified", "deleted"]);
 
@@ -315,6 +335,9 @@ export default class ComeGitherPlugin extends Plugin {
 	private sessionPromise: Promise<{ engine: SyncEngine; state: StateStore }> | null = null;
 	private pendingDrain: Promise<void> | null = null;
 	private rebaselineNoticed = false;
+	private deferNoticed = false;
+	// An unattended run (interval or startup) never opens the deletion modal.
+	private unattended = false;
 	// Paths with an open download prompt or a download in flight; file-open
 	// events for them are ignored so modals never stack.
 	private busyPaths = new Set<string>();
@@ -387,6 +410,7 @@ export default class ComeGitherPlugin extends Plugin {
 		// lazily on next use, after the retired engine's queue drains. Two
 		// engines can never run over the same files and state.
 		this.rebaselineNoticed = false; // a settings change opens a new episode
+		this.deferNoticed = false;
 		const old = this.sessionPromise;
 		if (old !== null) {
 			this.sessionPromise = null;
@@ -466,9 +490,12 @@ export default class ComeGitherPlugin extends Plugin {
 			conflictPolicy: this.settings.conflictPolicy,
 			configDir: this.app.vault.configDir,
 			excludedPrefixes: ["_conflicts/", `${this.pluginDir}/`, ".git/", ".trash/"],
-			maxDeletions: this.settings.deletionGuardThreshold > 0 ? this.settings.deletionGuardThreshold : Infinity,
+			maxDeletions: maxDeletionsFor(this.settings.deletionGuardThreshold),
 			confirmDeletions: (direction, paths) =>
-				new Promise((resolve) => new ConfirmDeletionsModal(this.app, direction, paths, resolve).open()),
+				confirmOrDefer(
+					this.unattended,
+					() => new Promise((resolve) => new ConfirmDeletionsModal(this.app, direction, paths, resolve).open()),
+				),
 		});
 		return { engine, state };
 	}
@@ -516,6 +543,7 @@ export default class ComeGitherPlugin extends Plugin {
 			return;
 		}
 		this.syncing = true;
+		this.unattended = quiet;
 		this.setStatus("syncing…");
 		// The status bar is not shown on mobile, so a manual sync announces
 		// itself; interval and startup runs stay quiet.
@@ -532,31 +560,36 @@ export default class ComeGitherPlugin extends Plugin {
 				({ pull, push } = await engine.sync());
 			}
 			await this.refreshLazyIndex();
-			const parts: string[] = [];
-			if (pull.upToDate && (push === null || push.commit === null)) parts.push("already up to date");
-			if (pull.fetched) parts.push(`${pull.fetched} fetched`);
-			if (pull.adopted) parts.push(`${pull.adopted} adopted`);
-			if (pull.placeholders) parts.push(`${pull.placeholders} placeholders`);
-			if (pull.merged) parts.push(`${pull.merged} merged`);
-			if (pull.deleted) parts.push(`${pull.deleted} deleted here`);
-			if (pull.conflicts) parts.push(`${pull.conflicts} conflicts (see _conflicts/ and the log)`);
-			if (push?.pushed) parts.push(`${push.pushed} pushed`);
-			if (push?.deletedRemote) parts.push(`${push.deletedRemote} deleted on GitHub`);
-			if (push && push.skipped > 0) {
-				const names = push.skippedPaths.slice(0, 2).join(", ");
-				parts.push(`${push.skipped} skipped (${names}${push.skippedPaths.length > 2 ? ", …" : ""})`);
-			}
+			const parts = syncParts(pull, push);
 			// A quiet run reports only real work; "already up to date" every
 			// interval tick would be noise.
 			const happened = parts.some((p) => p !== "already up to date");
 			if (!quiet || happened) new Notice(`Come Gither: ${parts.join(", ") || "done"}.`);
 			this.rebaselineNoticed = false; // a finished sync closes the episode
+			this.deferNoticed = false;
 			this.setStatus("idle");
 		} catch (e) {
+			if (e instanceof DeletionsDeferred) {
+				// Not a failure: the guarded half wrote nothing, and a manual sync
+				// asks. A pull before a deferred push did apply, so the lazy index
+				// still needs its refresh. One Notice per episode, not per tick.
+				await this.refreshLazyIndex();
+				// What a pull before the deferred push did still gets reported.
+				const done = e.pull ? syncParts(e.pull, null).filter((p) => p !== "already up to date") : [];
+				if (!this.deferNoticed || done.length > 0) {
+					this.deferNoticed = true;
+					new Notice(`Come Gither: ${[e.message, ...done].join("; ")}.`);
+				}
+				this.setStatus("paused: run Sync now");
+				return;
+			}
 			const message = e instanceof Error ? e.message : String(e);
 			this.logger.log("error", `sync failed: ${message}`);
 			new Notice(`Come Gither: sync failed — ${message}`);
 			this.setStatus("error");
+			this.deferNoticed = false; // a failure ends the paused episode
+			// A retried pull may have added placeholders before the failure.
+			await this.refreshLazyIndex().catch(() => {});
 		} finally {
 			await this.logger.flush();
 			this.syncing = false;
@@ -759,7 +792,7 @@ class ComeGitherSettingTab extends PluginSettingTab {
 			{ name: "Pull when Obsidian starts", control: { type: "toggle", key: "pullOnStart" } },
 			{
 				name: "Deletion guard threshold",
-				desc: "A sync that would delete more files than this asks first. 0 turns the guard off.",
+				desc: "A pull or push that would delete more files than this asks first; automatic and startup syncs pause instead until you run Sync now. 0 turns the guard off.",
 				control: { type: "number", key: "deletionGuardThreshold", min: 0, defaultValue: DEFAULT_SETTINGS.deletionGuardThreshold },
 			},
 		];
@@ -779,8 +812,9 @@ class ComeGitherSettingTab extends PluginSettingTab {
 			const n = Number(value);
 			s[key] = Number.isFinite(n) && n > 0 ? n : DEFAULT_SETTINGS.maxAutoFetchMB;
 		} else if (key === "deletionGuardThreshold") {
-			const n = Math.round(Number(value));
-			s[key] = Number.isFinite(n) && n >= 0 ? n : DEFAULT_SETTINGS.deletionGuardThreshold;
+			const n = parseDeletionThreshold(value);
+			if (n === null) return; // a cleared field keeps the saved value
+			s[key] = n;
 		} else {
 			s[key] = value;
 		}
@@ -857,11 +891,11 @@ class ComeGitherSettingTab extends PluginSettingTab {
 			.addToggle((t) => t.setValue(s.pullOnStart).onChange((v) => ((s.pullOnStart = v), save())));
 		new Setting(containerEl)
 			.setName("Deletion guard threshold")
-			.setDesc("A sync that would delete more files than this asks first. 0 turns the guard off.")
+			.setDesc("A pull or push that would delete more files than this asks first; automatic and startup syncs pause instead until you run Sync now. 0 turns the guard off.")
 			.addText((t) =>
 				t.setValue(String(s.deletionGuardThreshold)).onChange((v) => {
-					const n = Math.round(Number(v));
-					if (Number.isFinite(n) && n >= 0) {
+					const n = parseDeletionThreshold(v);
+					if (n !== null) {
 						s.deletionGuardThreshold = n;
 						save();
 					}
