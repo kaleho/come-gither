@@ -1,8 +1,8 @@
 ---
 id: FEAT-0002-A1D8F3F6
-status: proposed
+status: done
 created: '2026-09-22T17:08:50+00:00'
-updated: '2026-09-22T17:08:50+00:00'
+updated: '2026-09-22T20:06:33+00:00'
 advances: []
 verifies: []
 derived_from: []
