@@ -38,13 +38,14 @@ The first sync of a large vault takes a while and is safe to interrupt. Start it
 - **Conflict policy** — merge (default) or remote wins.
 - **Placeholder downloads** — ask first (default) or download immediately.
 - **Largest automatic download (MB)** — text files above this size, and all binary files, stay placeholders until you open them.
+- **Largest upload (MB)** — files above this size are skipped on push. The default is 30. GitHub refuses files over 100 MB, and a large upload can run out of memory on a phone.
 - **Automatic sync interval (minutes)** — 0 is off; otherwise 3 to 60.
 - **Pull when Obsidian starts** — on by default. The startup pull never pushes; local edits and deletions wait for a manual or interval sync.
 - **Deletion guard threshold** — 10 by default. A pull that would delete more files than this on the device, or a push that would delete more than this on GitHub, stops and asks first. Automatic and startup syncs pause instead until you run **Sync now**. 0 turns the guard off.
 
 ## Limits
 
-- Files over 30 MB cannot be uploaded through the GitHub API. The plugin skips them with a warning; push them with desktop git.
+- Files over the upload limit (30 MB by default) are skipped with a warning; push them with desktop git. GitHub refuses files over 100 MB at any setting.
 - Git LFS is not supported.
 - Syncing the config folder includes the code and settings of your other plugins. Anyone with write access to your repository can change what those plugins run. Use a repository only you control.
 - A conflict whose GitHub version is larger than the download limit is logged, but no copy lands in `_conflicts/`; resolve it with desktop git.
