@@ -37,6 +37,7 @@ interface ComeGitherSettings {
 	conflictPolicy: "merge" | "remote-wins";
 	lazyFetchMode: "prompt" | "auto";
 	maxAutoFetchMB: number;
+	maxPushMB: number;
 	autoSyncMinutes: number; // 0 = off; otherwise clamped to 3..60
 	pullOnStart: boolean;
 	deletionGuardThreshold: number; // 0 = off; a pull or push deleting more files asks first
@@ -50,12 +51,11 @@ const DEFAULT_SETTINGS: ComeGitherSettings = {
 	conflictPolicy: "merge",
 	lazyFetchMode: "prompt",
 	maxAutoFetchMB: 100,
+	maxPushMB: 30,
 	autoSyncMinutes: 0,
 	pullOnStart: true,
 	deletionGuardThreshold: 10,
 };
-
-const MAX_PUSH_BYTES = 30 * 1048576;
 
 class ObsidianHttp implements Http {
 	async request(req: HttpRequest): Promise<HttpResponse> {
@@ -486,7 +486,7 @@ export default class ComeGitherPlugin extends Plugin {
 			branch: this.settings.branch,
 			textExtensions: DEFAULT_TEXT_EXTENSIONS,
 			maxAutoFetchBytes: this.settings.maxAutoFetchMB * 1048576,
-			maxPushBytes: MAX_PUSH_BYTES,
+			maxPushBytes: this.settings.maxPushMB * 1048576,
 			conflictPolicy: this.settings.conflictPolicy,
 			configDir: this.app.vault.configDir,
 			excludedPrefixes: ["_conflicts/", `${this.pluginDir}/`, ".git/", ".trash/"],
@@ -785,6 +785,11 @@ class ComeGitherSettingTab extends PluginSettingTab {
 				control: { type: "number", key: "maxAutoFetchMB", min: 1, defaultValue: DEFAULT_SETTINGS.maxAutoFetchMB },
 			},
 			{
+				name: "Largest upload (MB)",
+				desc: "Files above this size are skipped on push. GitHub refuses files over 100 MB, and a large upload can run out of memory on a phone.",
+				control: { type: "number", key: "maxPushMB", min: 1, defaultValue: DEFAULT_SETTINGS.maxPushMB },
+			},
+			{
 				name: "Automatic sync interval (minutes)",
 				desc: "0 turns it off. Other values land between 3 and 60.",
 				control: { type: "number", key: "autoSyncMinutes", min: 0, max: 60, defaultValue: 0 },
@@ -808,9 +813,9 @@ class ComeGitherSettingTab extends PluginSettingTab {
 			s[key] = String(value ?? "").trim();
 		} else if (key === "autoSyncMinutes") {
 			s[key] = clampSyncMinutes(Number(value));
-		} else if (key === "maxAutoFetchMB") {
+		} else if (key === "maxAutoFetchMB" || key === "maxPushMB") {
 			const n = Number(value);
-			s[key] = Number.isFinite(n) && n > 0 ? n : DEFAULT_SETTINGS.maxAutoFetchMB;
+			s[key] = Number.isFinite(n) && n > 0 ? n : DEFAULT_SETTINGS[key];
 		} else if (key === "deletionGuardThreshold") {
 			const n = parseDeletionThreshold(value);
 			if (n === null) return; // a cleared field keeps the saved value
@@ -870,6 +875,18 @@ class ComeGitherSettingTab extends PluginSettingTab {
 					const n = Number(v);
 					if (Number.isFinite(n) && n > 0) {
 						s.maxAutoFetchMB = n;
+						save();
+					}
+				}),
+			);
+		new Setting(containerEl)
+			.setName("Largest upload (MB)")
+			.setDesc("Files above this size are skipped on push. GitHub refuses files over 100 MB, and a large upload can run out of memory on a phone.")
+			.addText((t) =>
+				t.setValue(String(s.maxPushMB)).onChange((v) => {
+					const n = Number(v);
+					if (Number.isFinite(n) && n > 0) {
+						s.maxPushMB = n;
 						save();
 					}
 				}),
