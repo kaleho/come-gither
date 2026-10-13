@@ -1,12 +1,15 @@
 ---
 id: FEAT-0008-447BC47D
-status: proposed
+status: done
 created: '2026-10-13T18:31:10+00:00'
-updated: '2026-10-13T18:31:10+00:00'
+updated: '2026-10-13T18:44:57+00:00'
 advances: []
 verifies: []
-derived_from: [SES-0001]
-related: [FND-0001, FEAT-0006]
+derived_from:
+- SES-0001
+related:
+- FND-0001
+- FEAT-0006
 branches:
 - session/large-file-support
 external: {}
