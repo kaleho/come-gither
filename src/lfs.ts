@@ -247,3 +247,61 @@ export function parseLfsPointer(data: ArrayBuffer): { oid: string; size: number 
 	if (!oid || !size || text.includes("\r")) return null;
 	return { oid: oid[1], size: Number(size[1]) };
 }
+
+async function batchOrThrow(lfs: LfsClient, operation: "upload" | "download", oid: string, size: number): Promise<LfsBatchResult> {
+	const res = await lfs.batch(operation, oid, size);
+	if (res.status === 401 || res.status === 403) {
+		throw new Error(`LFS batch ${operation} failed: HTTP ${res.status}: the token cannot use LFS on this repo`);
+	}
+	if (res.status !== 200) throw new Error(`LFS batch ${operation} failed: HTTP ${res.status}`);
+	if (res.error) throw new Error(`LFS batch ${operation} failed: object error ${res.error.code}: ${res.error.message}`);
+	return res;
+}
+
+/** Batch upload → PUT (skipped when GitHub already has the object) → verify (when requested). Throws an Error with a clear message on any failure. */
+export async function uploadLfsObject(lfs: LfsClient, put: Uploader, data: ArrayBuffer, oid: string): Promise<void> {
+	const size = data.byteLength;
+	const { actions } = await batchOrThrow(lfs, "upload", oid, size);
+	if (actions.upload) {
+		const status = await put(actions.upload, data);
+		if (!is2xx(status)) throw new Error(`LFS upload failed: HTTP ${status}`);
+	}
+	if (actions.verify) {
+		const status = await lfs.verify(actions.verify, oid, size);
+		if (!is2xx(status)) throw new Error(`LFS verify failed: HTTP ${status}`);
+	}
+}
+
+const DOWNLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
+
+/** Batch download → ranged GETs of chunkBytes (default 8 MiB) → concatenate → SHA-256 must equal oid and length must equal size. Throws on any failure. */
+export async function downloadLfsObject(
+	lfs: LfsClient,
+	oid: string,
+	size: number,
+	chunkBytes = DOWNLOAD_CHUNK_BYTES,
+): Promise<ArrayBuffer> {
+	// One copy of the file plus one chunk in memory.
+	const out = new Uint8Array(size);
+	if (size > 0) {
+		const { actions } = await batchOrThrow(lfs, "download", oid, size);
+		if (!actions.download) throw new Error("LFS batch download failed: no download action");
+		for (let start = 0; start < size; start += chunkBytes) {
+			const end = Math.min(start + chunkBytes, size) - 1;
+			const res = await lfs.readRange(actions.download, start, end);
+			const got = res.data.byteLength;
+			// A server that ignores Range sends the whole file once, on the first request.
+			if (res.status === 200 && start === 0 && got === size) {
+				out.set(new Uint8Array(res.data));
+				break;
+			}
+			if (res.status !== 206 || got !== end - start + 1) {
+				throw new Error(`LFS download range ${start}-${end}: HTTP ${res.status} with ${got} bytes, expected ${end - start + 1}`);
+			}
+			out.set(new Uint8Array(res.data), start);
+		}
+	}
+	const hash = await sha256Hex(out.buffer as ArrayBuffer);
+	if (hash !== oid) throw new Error(`LFS download: SHA-256 mismatch (got ${hash.slice(0, 12)}…, expected ${oid.slice(0, 12)}…)`);
+	return out.buffer as ArrayBuffer;
+}
