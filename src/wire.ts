@@ -76,3 +76,8 @@ export function syncParts(pull: PullSummary, push: PushSummary | null): string[]
 	}
 	return parts;
 }
+
+export function formatSize(bytes: number): string {
+	const mb = bytes / 1048576;
+	return mb >= 1 ? `${mb.toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}

@@ -3,6 +3,7 @@ import {
 	cacheBustedUrl,
 	clampSyncMinutes,
 	confirmOrDefer,
+	formatSize,
 	lowercaseHeaders,
 	maxDeletionsFor,
 	parentDirs,
@@ -128,5 +129,17 @@ describe("syncParts", () => {
 	it("names at most two skipped files", () => {
 		expect(syncParts(pull(), push({ skipped: 3, skippedPaths: ["a", "b", "c"] }))).toEqual(["3 skipped (a, b, …)"]);
 		expect(syncParts(pull(), push({ skipped: 1, skippedPaths: ["a"] }))).toEqual(["1 skipped (a)"]);
+	});
+});
+
+describe("formatSize", () => {
+	it("shows MB to one decimal at 1 MB or more", () => {
+		expect(formatSize(1048576)).toBe("1.0 MB");
+		expect(formatSize(52.3 * 1048576)).toBe("52.3 MB");
+	});
+	it("shows whole KB below 1 MB, never 0 KB", () => {
+		expect(formatSize(1048575)).toBe("1024 KB");
+		expect(formatSize(2048)).toBe("2 KB");
+		expect(formatSize(1)).toBe("1 KB");
 	});
 });

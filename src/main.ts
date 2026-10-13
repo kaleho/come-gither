@@ -22,6 +22,7 @@ import {
 	cacheBustedUrl,
 	clampSyncMinutes,
 	confirmOrDefer,
+	formatSize,
 	lowercaseHeaders,
 	maxDeletionsFor,
 	parentDirs,
@@ -137,8 +138,7 @@ class ConfirmFetchModal extends Modal {
 	}
 
 	onOpen(): void {
-		const mb = this.sizeBytes / 1048576;
-		const size = mb >= 1 ? `${mb.toFixed(1)} MB` : `${Math.max(1, Math.round(this.sizeBytes / 1024))} KB`;
+		const size = formatSize(this.sizeBytes);
 		this.contentEl.createEl("p", {
 			text: `${this.path} is not on this device yet. Download the full file (${size})?`,
 		});
@@ -299,7 +299,7 @@ class PreviewView extends ItemView {
 	private section(
 		root: HTMLElement,
 		title: string,
-		items: { path: string; action: string }[],
+		items: { path: string; action: string; size?: number }[],
 		labels: Record<string, string>,
 		extra: ((row: HTMLElement, item: { path: string; action: string }) => void) | null,
 	): void {
@@ -310,7 +310,11 @@ class PreviewView extends ItemView {
 			const row = list.createDiv({ cls: "come-gither-preview-row" });
 			const info = row.createDiv({ cls: "come-gither-preview-info" });
 			info.createDiv({ cls: "come-gither-preview-path", text: item.path });
-			info.createDiv({ cls: "come-gither-preview-action", text: labels[item.action] ?? item.action });
+			const label = labels[item.action] ?? item.action;
+			info.createDiv({
+				cls: "come-gither-preview-action",
+				text: item.size === undefined ? label : `${label} (${formatSize(item.size)})`,
+			});
 			if (extra) extra(row, item);
 		}
 	}

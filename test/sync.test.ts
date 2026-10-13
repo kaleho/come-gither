@@ -1166,7 +1166,7 @@ describe("preview: remaining classifications", () => {
 		expect(plan.incoming.find((r) => r.path.startsWith("_conflicts/"))).toBeUndefined();
 		expect(plan.outgoing).toEqual(
 			expect.arrayContaining([
-				{ path: "big-note.md", action: "skip-oversize" },
+				{ path: "big-note.md", action: "skip-oversize", size: 20 },
 				{ path: "gone.md", action: "modified" },
 			]),
 		);
@@ -1299,7 +1299,7 @@ describe("push protections", () => {
 		expect(reads).not.toContain("huge.bin");
 		reads.length = 0;
 		const plan = await engine.preview();
-		expect(plan.outgoing).toEqual([{ path: "huge.bin", action: "skip-oversize" }]);
+		expect(plan.outgoing).toEqual([{ path: "huge.bin", action: "skip-oversize", size: 26 }]);
 		expect(reads).not.toContain("huge.bin");
 	});
 

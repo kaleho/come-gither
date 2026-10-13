@@ -91,7 +91,7 @@ export type OutgoingAction =
 export interface SyncPlan {
 	headMoved: boolean;
 	incoming: { path: string; action: IncomingAction }[];
-	outgoing: { path: string; action: OutgoingAction }[];
+	outgoing: { path: string; action: OutgoingAction; size?: number }[];
 }
 
 export type LogFn = (level: "info" | "warn" | "error", message: string) => void;
@@ -282,7 +282,7 @@ export class SyncEngine {
 				if (entry && stat.size === entry.size && (await this.localShaIfChanged(path, entry, false)) === "clean") {
 					continue; // only the mtime drifted; sync will heal it silently
 				}
-				plan.outgoing.push({ path, action: "skip-oversize" });
+				plan.outgoing.push({ path, action: "skip-oversize", size: stat.size });
 				continue;
 			}
 			const localSha = await this.localShaIfChanged(path, entry, false);
