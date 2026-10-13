@@ -6,6 +6,7 @@ import {
 	LfsClient,
 	type LfsTestDeps,
 	type Uploader,
+	downloadLfsObject,
 	gitattributesLine,
 	httpUploader,
 	lfsPointer,
@@ -13,6 +14,7 @@ import {
 	parseLfsPointer,
 	runLfsTest,
 	sha256Hex,
+	uploadLfsObject,
 } from "../src/lfs";
 import { FakeGitHub, FakeHttp, binaryResponse, jsonResponse } from "./fakes";
 
@@ -451,5 +453,195 @@ describe("lfsTestSummary", () => {
 
 	it("handles no steps", () => {
 		expect(lfsTestSummary([])).toEqual({ passed: 0, total: 0, lines: [] });
+	});
+});
+
+describe("uploadLfsObject", () => {
+	const data = bytes(10);
+	const buf = data.buffer as ArrayBuffer;
+	const oid = sha256(data);
+	const batchWith = (obj: Record<string, unknown>) => jsonResponse({ objects: [{ oid, size: 10, ...obj }] });
+
+	function setup(batch: Partial<import("../src/ports").HttpResponse>, verifyStatus = 200, putStatus = 200) {
+		const http = new FakeHttp();
+		http.on("POST", BATCH, batch);
+		http.on("POST", VERIFY.href, { status: verifyStatus });
+		const order: string[] = [];
+		const puts: { action: unknown; data: ArrayBuffer }[] = [];
+		const put: Uploader = async (action, body) => {
+			order.push("put");
+			puts.push({ action, data: body });
+			return putStatus;
+		};
+		return { http, put, puts, order, lfs: makeLfs(http) };
+	}
+
+	it("batches, PUTs the body to the upload action, then verifies", async () => {
+		const { http, put, puts, lfs } = setup(batchWith({ actions: { upload: UPLOAD, verify: VERIFY } }));
+		await uploadLfsObject(lfs, put, buf, oid);
+		expect(http.bodyOf(0)).toMatchObject({ operation: "upload", objects: [{ oid, size: 10 }] });
+		expect(puts).toEqual([{ action: UPLOAD, data: buf }]);
+		expect(http.requests.map((r) => r.url)).toEqual([BATCH, VERIFY.href]);
+		expect(http.bodyOf(1)).toEqual({ oid, size: 10 });
+	});
+
+	it("skips the PUT when GitHub already has the object, but still verifies if asked", async () => {
+		const { http, put, puts, lfs } = setup(batchWith({ actions: { verify: VERIFY } }));
+		await uploadLfsObject(lfs, put, buf, oid);
+		expect(puts).toEqual([]);
+		expect(http.requests.map((r) => r.url)).toEqual([BATCH, VERIFY.href]);
+	});
+
+	it("does nothing after the batch when the object is present and no verify is offered", async () => {
+		const { http, put, puts, lfs } = setup(batchWith({}));
+		await uploadLfsObject(lfs, put, buf, oid);
+		expect(puts).toEqual([]);
+		expect(http.requests.map((r) => r.url)).toEqual([BATCH]);
+	});
+
+	it("does not verify when the PUT succeeded and no verify is offered", async () => {
+		const { http, put, puts, lfs } = setup(batchWith({ actions: { upload: UPLOAD } }));
+		await uploadLfsObject(lfs, put, buf, oid);
+		expect(puts).toHaveLength(1);
+		expect(http.requests.map((r) => r.url)).toEqual([BATCH]);
+	});
+
+	it.each([401, 403])("throws that the token cannot use LFS on HTTP %i", async (status) => {
+		const { put, puts, lfs } = setup({ status, text: "no" });
+		await expect(uploadLfsObject(lfs, put, buf, oid)).rejects.toThrow(
+			new RegExp(`HTTP ${status}.*token cannot use LFS`),
+		);
+		expect(puts).toEqual([]);
+	});
+
+	it("throws the status on any other batch failure", async () => {
+		const { put, lfs } = setup({ status: 500, text: "boom" });
+		await expect(uploadLfsObject(lfs, put, buf, oid)).rejects.toThrow(/LFS batch upload failed: HTTP 500/);
+	});
+
+	it("throws the object error code and message", async () => {
+		const { put, puts, lfs } = setup(batchWith({ error: { code: 422, message: "Invalid object" } }));
+		await expect(uploadLfsObject(lfs, put, buf, oid)).rejects.toThrow(/object error 422: Invalid object/);
+		expect(puts).toEqual([]);
+	});
+
+	it("throws the PUT status and does not verify on a non-2xx PUT", async () => {
+		const { http, put, lfs } = setup(batchWith({ actions: { upload: UPLOAD, verify: VERIFY } }), 200, 500);
+		await expect(uploadLfsObject(lfs, put, buf, oid)).rejects.toThrow(/LFS upload failed: HTTP 500/);
+		expect(http.requests.map((r) => r.url)).toEqual([BATCH]);
+	});
+
+	it("propagates an uploader that throws as an Error", async () => {
+		const { lfs } = setup(batchWith({ actions: { upload: UPLOAD } }));
+		const put: Uploader = async () => {
+			throw new Error("Failed to fetch");
+		};
+		await expect(uploadLfsObject(lfs, put, buf, oid)).rejects.toThrow("Failed to fetch");
+	});
+
+	it("throws the verify status on a non-2xx verify", async () => {
+		const { put, lfs } = setup(batchWith({ actions: { upload: UPLOAD, verify: VERIFY } }), 404);
+		await expect(uploadLfsObject(lfs, put, buf, oid)).rejects.toThrow(/LFS verify failed: HTTP 404/);
+	});
+});
+
+describe("downloadLfsObject", () => {
+	const data = bytes(10);
+	const oid = sha256(data);
+	const batchOk = jsonResponse({ objects: [{ oid, size: 10, actions: { download: DOWNLOAD } }] });
+
+	function setup(batch: Partial<import("../src/ports").HttpResponse>, ranges: Partial<import("../src/ports").HttpResponse>[]) {
+		const http = new FakeHttp();
+		http.on("POST", BATCH, batch);
+		for (const r of ranges) http.on("GET", DOWNLOAD.href, r, 1);
+		return { http, lfs: makeLfs(http) };
+	}
+	const rangeHeaders = (http: FakeHttp) => http.requests.filter((r) => r.method === "GET").map((r) => r.headers?.Range);
+
+	it("reads the object in ranges of chunkBytes and returns the whole file", async () => {
+		const { http, lfs } = setup(batchOk, [
+			binaryResponse(data.slice(0, 4), 206),
+			binaryResponse(data.slice(4, 8), 206),
+			binaryResponse(data.slice(8), 206),
+		]);
+		const out = await downloadLfsObject(lfs, oid, 10, 4);
+		expect(new Uint8Array(out)).toEqual(data);
+		expect(http.bodyOf(0)).toMatchObject({ operation: "download", objects: [{ oid, size: 10 }] });
+		expect(rangeHeaders(http)).toEqual(["bytes=0-3", "bytes=4-7", "bytes=8-9"]);
+		expect(http.requests[1].headers).toEqual({ "X-Sig": "d", Range: "bytes=0-3" });
+	});
+
+	it("uses 8 MiB ranges by default", async () => {
+		const big = bytes(8 * MIB + 3);
+		const { http, lfs } = setup(jsonResponse({ objects: [{ actions: { download: DOWNLOAD } }] }), [
+			binaryResponse(big.slice(0, 8 * MIB), 206),
+			binaryResponse(big.slice(8 * MIB), 206),
+		]);
+		const out = await downloadLfsObject(lfs, sha256(big), big.length);
+		expect(out.byteLength).toBe(big.length);
+		expect(rangeHeaders(http)).toEqual([`bytes=0-${8 * MIB - 1}`, `bytes=${8 * MIB}-${8 * MIB + 2}`]);
+	});
+
+	it("accepts a 200 with the full body when the server ignores Range, and stops", async () => {
+		const { http, lfs } = setup(batchOk, [binaryResponse(data, 200)]);
+		const out = await downloadLfsObject(lfs, oid, 10, 4);
+		expect(new Uint8Array(out)).toEqual(data);
+		expect(rangeHeaders(http)).toEqual(["bytes=0-3"]);
+	});
+
+	it("rejects a 200 whose body is not the full file", async () => {
+		const { lfs } = setup(batchOk, [binaryResponse(data.slice(0, 4), 200)]);
+		await expect(downloadLfsObject(lfs, oid, 10, 4)).rejects.toThrow(/HTTP 200 with 4 bytes/);
+	});
+
+	it("rejects a 200 full body on a later range", async () => {
+		const { lfs } = setup(batchOk, [binaryResponse(data.slice(0, 4), 206), binaryResponse(data, 200)]);
+		await expect(downloadLfsObject(lfs, oid, 10, 4)).rejects.toThrow(/range 4-7: HTTP 200 with 10 bytes/);
+	});
+
+	it("rejects a range of the wrong length", async () => {
+		const { lfs } = setup(batchOk, [binaryResponse(data.slice(0, 3), 206)]);
+		await expect(downloadLfsObject(lfs, oid, 10, 4)).rejects.toThrow(/range 0-3: HTTP 206 with 3 bytes, expected 4/);
+	});
+
+	it("rejects a status that is not 206 or 200", async () => {
+		const { lfs } = setup(batchOk, [binaryResponse(new Uint8Array(0), 403)]);
+		await expect(downloadLfsObject(lfs, oid, 10, 4)).rejects.toThrow(/range 0-3: HTTP 403/);
+	});
+
+	it("rejects content whose SHA-256 is not the oid", async () => {
+		const { lfs } = setup(batchOk, [binaryResponse(bytes(10, 1), 200)]);
+		await expect(downloadLfsObject(lfs, oid, 10)).rejects.toThrow(/SHA-256 mismatch/);
+	});
+
+	it("returns an empty buffer for size 0 without any request when the oid is the empty hash", async () => {
+		const { http, lfs } = setup(batchOk, []);
+		const out = await downloadLfsObject(lfs, sha256(new Uint8Array(0)), 0);
+		expect(out.byteLength).toBe(0);
+		expect(http.requests).toEqual([]);
+	});
+
+	it("rejects size 0 when the oid is not the empty hash", async () => {
+		const { lfs } = setup(batchOk, []);
+		await expect(downloadLfsObject(lfs, oid, 0)).rejects.toThrow(/SHA-256 mismatch/);
+	});
+
+	it("throws the batch status, the object error, or a missing download action", async () => {
+		await expect(downloadLfsObject(setup({ status: 401, text: "" }, []).lfs, oid, 10)).rejects.toThrow(
+			/HTTP 401.*token cannot use LFS/,
+		);
+		await expect(downloadLfsObject(setup({ status: 502, text: "" }, []).lfs, oid, 10)).rejects.toThrow(
+			/LFS batch download failed: HTTP 502/,
+		);
+		await expect(
+			downloadLfsObject(
+				setup(jsonResponse({ objects: [{ error: { code: 404, message: "Object does not exist" } }] }), []).lfs,
+				oid,
+				10,
+			),
+		).rejects.toThrow(/object error 404: Object does not exist/);
+		await expect(downloadLfsObject(setup(jsonResponse({ objects: [{}] }), []).lfs, oid, 10)).rejects.toThrow(
+			/no download action/,
+		);
 	});
 });
