@@ -86,3 +86,21 @@ export function formatSize(bytes: number): string {
 export function largestFirst<T extends { size: number }>(items: T[]): T[] {
 	return items.filter((i) => i.size > 0).sort((a, b) => b.size - a.size);
 }
+
+/** A 10-cell text bar; an empty total reads as complete. */
+export function progressBar(done: number, total: number): string {
+	const filled = total > 0 ? Math.min(10, Math.floor((done / total) * 10)) : 10;
+	return "▓".repeat(filled) + "░".repeat(10 - filled);
+}
+
+/** The LFS download notice. */
+export function progressText(name: string, done: number, total: number): string {
+	return `Downloading ${name}: ${formatSize(done)} of ${formatSize(total)} ${progressBar(done, total)}`;
+}
+
+/** The LFS upload notice: a timer, never a percentage (one requestUrl PUT reports nothing until it ends). */
+export function uploadText(name: string, size: number, elapsedMs: number, index: number, total: number): string {
+	const s = Math.floor(elapsedMs / 1000);
+	const clock = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+	return `Uploading ${name} (${formatSize(size)})… ${clock}${total > 1 ? ` — ${index} of ${total}` : ""}`;
+}

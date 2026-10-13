@@ -571,6 +571,32 @@ describe("downloadLfsObject", () => {
 		expect(http.requests[1].headers).toEqual({ "X-Sig": "d", Range: "bytes=0-3" });
 	});
 
+	it("reports progress at the start and after each range", async () => {
+		const { lfs } = setup(batchOk, [
+			binaryResponse(data.slice(0, 4), 206),
+			binaryResponse(data.slice(4, 8), 206),
+			binaryResponse(data.slice(8), 206),
+		]);
+		const seen: [number, number][] = [];
+		await downloadLfsObject(lfs, oid, 10, 4, (d, t) => seen.push([d, t]));
+		expect(seen).toEqual([
+			[0, 10],
+			[4, 10],
+			[8, 10],
+			[10, 10],
+		]);
+	});
+
+	it("reports progress once more for a full 200", async () => {
+		const { lfs } = setup(batchOk, [binaryResponse(data, 200)]);
+		const seen: [number, number][] = [];
+		await downloadLfsObject(lfs, oid, 10, 4, (d, t) => seen.push([d, t]));
+		expect(seen).toEqual([
+			[0, 10],
+			[10, 10],
+		]);
+	});
+
 	it("uses 8 MiB ranges by default", async () => {
 		const big = bytes(8 * MIB + 3);
 		const { http, lfs } = setup(jsonResponse({ objects: [{ actions: { download: DOWNLOAD } }] }), [

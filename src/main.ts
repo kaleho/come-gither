@@ -15,13 +15,13 @@ import {
 } from "obsidian";
 import { BETA_FEATURES, NO_BETA_FEATURES, betaFeatureText, ribbonMenuItems } from "./beta";
 import { GitHubClient } from "./github";
-import { LfsClient, httpUploader, lfsTestSummary, runLfsTest } from "./lfs";
+import { LfsClient, downloadLfsObject, httpUploader, lfsTestSummary, runLfsTest, uploadLfsObject } from "./lfs";
 import { RingLogger } from "./log";
 import type { SettingDefinitionItem } from "obsidian";
 import type { Files, Http, HttpRequest, HttpResponse } from "./ports";
 import { StateStore } from "./state";
 import { DEFAULT_TEXT_EXTENSIONS, DeletionsDeferred, SyncEngine } from "./sync";
-import type { DeletionDecision, PullSummary, PushSummary, SyncPlan } from "./sync";
+import type { DeletionDecision, LfsOps, PullSummary, PushSummary, SyncPlan } from "./sync";
 import {
 	cacheBustedUrl,
 	clampSyncMinutes,
@@ -32,7 +32,9 @@ import {
 	maxDeletionsFor,
 	parentDirs,
 	parseDeletionThreshold,
+	progressText,
 	syncParts,
+	uploadText,
 } from "./wire";
 
 interface ComeGitherSettings {
@@ -663,8 +665,37 @@ export default class ComeGitherPlugin extends Plugin {
 					this.unattended,
 					() => new Promise((resolve) => new ConfirmDeletionsModal(this.app, direction, paths, resolve).open()),
 				),
+			// Beta only. Toggling beta saves settings, which retires this engine
+			// and rebuilds it on next use, so no restart is needed.
+			...(this.settings.betaFeatures ? { lfs: this.lfsOps() } : {}),
 		});
 		return { engine, state };
+	}
+
+	/** LFS transfers for sync (beta). Uploads use requestUrl only: storage CORS blocks fetch (DEC-0002). */
+	private lfsOps(): LfsOps {
+		// No cache-buster on LFS traffic: it breaks presigned storage URLs.
+		const rawHttp = new ObsidianHttp({ bustCache: false });
+		const { owner, repo, token } = this.settings;
+		const client = new LfsClient(rawHttp, { owner, repo, token });
+		return {
+			upload: async (data, oid, info) => {
+				const name = info.path.slice(info.path.lastIndexOf("/") + 1);
+				const start = Date.now();
+				const notice = new Notice("", 0);
+				const tick = () =>
+					notice.setMessage(`Come Gither: ${uploadText(name, data.byteLength, Date.now() - start, info.index, info.total)}`);
+				tick();
+				const timer = window.setInterval(tick, 1000);
+				try {
+					await uploadLfsObject(client, httpUploader(rawHttp), data, oid);
+				} finally {
+					window.clearInterval(timer);
+					notice.hide();
+				}
+			},
+			download: (oid, size, onProgress) => downloadLfsObject(client, oid, size, undefined, onProgress),
+		};
 	}
 
 	async openPreview(): Promise<void> {
@@ -810,13 +841,19 @@ export default class ComeGitherPlugin extends Plugin {
 
 	async downloadAndOpen(path: string, leaf?: WorkspaceLeaf): Promise<void> {
 		this.busyPaths.add(path);
+		// Created on the first progress report, so only LFS downloads show it.
+		let progress: Notice | null = null;
+		const name = path.slice(path.lastIndexOf("/") + 1);
 		try {
 			if (this.syncing) {
 				this.logger.log("info", `download of ${path} queued behind the running sync`);
 				new Notice("Come Gither: the download starts when the running sync finishes.");
 			}
 			const engine = await this.getEngine();
-			const result = await engine.fetchLazy(path);
+			const result = await engine.fetchLazy(path, (done, total) => {
+				progress ??= new Notice("", 0);
+				progress.setMessage(`Come Gither: ${progressText(name, done, total)}`);
+			});
 			if (result === "fetched") {
 				this.lazySizes.delete(path);
 				// getAbstractFileByPath works on every supported version.
@@ -851,6 +888,7 @@ export default class ComeGitherPlugin extends Plugin {
 			this.logger.log("error", `download of ${path} failed: ${message}`);
 			new Notice(`Come Gither: download failed — ${message}`);
 		} finally {
+			(progress as Notice | null)?.hide(); // assigned in the callback; TS cannot see it
 			this.busyPaths.delete(path);
 			await this.logger.flush();
 		}
@@ -985,6 +1023,9 @@ export default class ComeGitherPlugin extends Plugin {
 	}
 }
 
+const UPLOAD_DESC =
+	'Files above this size are skipped on push. GitHub refuses files over 100 MB unless the beta "Sync large files with Git LFS" is on (LFS limit: 2 GB). A large upload can run out of memory on a phone.';
+
 const BETA_DESC =
 	"Turns on unfinished features listed below. They may change or break; read what each one does before you turn this on.";
 
@@ -1025,7 +1066,7 @@ class ComeGitherSettingTab extends PluginSettingTab {
 			},
 			{
 				name: "Largest upload (MB)",
-				desc: "Files above this size are skipped on push. GitHub refuses files over 100 MB, and a large upload can run out of memory on a phone.",
+				desc: UPLOAD_DESC,
 				control: { type: "number", key: "maxPushMB", min: 1, defaultValue: DEFAULT_SETTINGS.maxPushMB },
 			},
 			{
@@ -1125,7 +1166,7 @@ class ComeGitherSettingTab extends PluginSettingTab {
 			);
 		new Setting(containerEl)
 			.setName("Largest upload (MB)")
-			.setDesc("Files above this size are skipped on push. GitHub refuses files over 100 MB, and a large upload can run out of memory on a phone.")
+			.setDesc(UPLOAD_DESC)
 			.addText((t) =>
 				t.setValue(String(s.maxPushMB)).onChange((v) => {
 					const n = Number(v);

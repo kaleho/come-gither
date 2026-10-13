@@ -41,10 +41,14 @@ export interface SyncConfig {
 }
 
 export interface LfsOps {
-	/** Stores the object on GitHub; throws on failure. */
-	upload(data: ArrayBuffer, oid: string): Promise<void>;
-	/** The object's verified content; throws on failure. */
-	download(oid: string, size: number): Promise<ArrayBuffer>;
+	/**
+	 * Stores the object on GitHub; throws on failure. `info` is for progress UI:
+	 * index is 1-based; total counts this push's LFS candidates (see
+	 * lfsCandidates), so it can exceed the uploads actually attempted.
+	 */
+	upload(data: ArrayBuffer, oid: string, info: { path: string; index: number; total: number }): Promise<void>;
+	/** The object's verified content; throws on failure. onProgress gets (bytes done, size). */
+	download(oid: string, size: number, onProgress?: (done: number, total: number) => void): Promise<ArrayBuffer>;
 }
 
 export type DeletionDecision = "delete" | "keep" | "defer";
@@ -183,8 +187,9 @@ export class SyncEngine {
 
 	private retired = false;
 
-	fetchLazy(path: string): Promise<"fetched" | "not-lazy" | "modified"> {
-		return this.locked(() => this.doFetchLazy(path));
+	/** onProgress reports an LFS download only; a plain git blob arrives in one request. */
+	fetchLazy(path: string, onProgress?: (done: number, total: number) => void): Promise<"fetched" | "not-lazy" | "modified"> {
+		return this.locked(() => this.doFetchLazy(path, onProgress));
 	}
 
 	evict(path: string): Promise<"evicted" | "not-evictable" | "modified"> {
@@ -219,14 +224,14 @@ export class SyncEngine {
 		return this.locked(() => this.doPull());
 	}
 
-	private async doFetchLazy(path: string): Promise<"fetched" | "not-lazy" | "modified"> {
+	private async doFetchLazy(path: string, onProgress?: (done: number, total: number) => void): Promise<"fetched" | "not-lazy" | "modified"> {
 		const entry = this.state.state.files[path];
 		if (!entry?.lazy) return "not-lazy";
 		if ((await this.localShaIfChanged(path, entry)) !== "clean") {
 			this.log("warn", `${path} was modified locally; not overwriting it with the remote content`);
 			return "modified";
 		}
-		const data = await this.fetchContent(entry);
+		const data = await this.fetchContent(entry, onProgress);
 		await this.files.writeBinary(path, data);
 		await this.record(path, entry.baseBlobSha, false, undefined, entry.mode);
 		await this.state.flush(); // a single-entry change never reaches the cadence threshold
@@ -404,8 +409,10 @@ export class SyncEngine {
 			this.log("info", `restored ${guarded.length} files here (${placeholders} as placeholders)`);
 			listed = await listLocal();
 		}
-		if (this.config.lfs && (await this.appendGitattributes(listed))) listed = await listLocal();
+		const lfsCandidates = this.config.lfs ? await this.lfsCandidates(listed) : [];
+		if (await this.appendGitattributes(lfsCandidates)) listed = await listLocal();
 		const localPaths = new Set(listed);
+		let lfsIndex = 0;
 
 		for (const path of localPaths) {
 			const entry = this.state.state.files[path];
@@ -467,7 +474,9 @@ export class SyncEngine {
 					continue;
 				}
 				try {
-					await this.config.lfs.upload(data, oid);
+					lfsIndex += 1;
+					// max: a file edited between the candidate scan and here can add an upload.
+					await this.config.lfs.upload(data, oid, { path, index: lfsIndex, total: Math.max(lfsCandidates.length, lfsIndex) });
 				} catch (e) {
 					summary.skipped += 1;
 					summary.skippedPaths.push(path);
@@ -988,25 +997,33 @@ export class SyncEngine {
 	}
 
 	/**
-	 * Appends the exact-path LFS line for each file this push may send through
-	 * LFS, BEFORE the scan, so .gitattributes rides in the same commit as an
-	 * ordinary changed file. Candidates come from stat alone (fingerprint
+	 * The files this push may send through LFS, from stat alone (fingerprint
 	 * changed, within the caps, and a downloaded LFS entry or over the
-	 * threshold), so no file is read here: a line for a file whose upload then
-	 * fails, or whose mtime only drifted, is harmless (DEC-0002). Append-only.
-	 * True when written.
+	 * threshold), so no file is read here. A superset of the uploads: a file
+	 * whose mtime only drifted is a candidate but hashes clean.
 	 */
-	private async appendGitattributes(paths: string[]): Promise<boolean> {
-		const lines: string[] = [];
+	private async lfsCandidates(paths: string[]): Promise<string[]> {
+		const out: string[] = [];
 		for (const path of paths) {
 			const entry = this.state.state.files[path];
 			const stat = await this.files.stat(path);
 			if (!stat || (entry && stat.mtime === entry.mtime && stat.size === entry.size)) continue;
 			// A placeholder is never uploaded (a drifted stub would add a line for nothing).
 			if (stat.size <= this.pushCap() && ((entry?.lfs !== undefined && !entry.lazy) || this.lfsBySize(path, stat.size))) {
-				lines.push(gitattributesLine(path));
+				out.push(path);
 			}
 		}
+		return out;
+	}
+
+	/**
+	 * Appends the exact-path LFS line for each candidate BEFORE the scan, so
+	 * .gitattributes rides in the same commit as an ordinary changed file. A
+	 * line for a file whose upload then fails, or whose mtime only drifted, is
+	 * harmless (DEC-0002). Append-only. True when written.
+	 */
+	private async appendGitattributes(candidates: string[]): Promise<boolean> {
+		const lines = candidates.map((p) => gitattributesLine(p));
 		if (lines.length === 0) return false;
 		await this.doFetchLazy(GITATTRIBUTES); // a placeholder's real lines come first
 		const existing = (await this.files.stat(GITATTRIBUTES))
@@ -1021,10 +1038,10 @@ export class SyncEngine {
 	}
 
 	/** An entry's real content: from LFS for an LFS file, else its git blob. */
-	private fetchContent(entry: FileEntry): Promise<ArrayBuffer> {
+	private fetchContent(entry: FileEntry, onProgress?: (done: number, total: number) => void): Promise<ArrayBuffer> {
 		if (!entry.lfs) return this.gh.getBlobRaw(entry.baseBlobSha);
 		if (!this.config.lfs) throw new Error("this is a Git LFS file; turn on beta features to download it");
-		return this.config.lfs.download(entry.lfs.oid, entry.lfs.size);
+		return this.config.lfs.download(entry.lfs.oid, entry.lfs.size, onProgress);
 	}
 
 	private maxLfsBytes(): number {

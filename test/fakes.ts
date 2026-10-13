@@ -360,18 +360,21 @@ export class FakeLfs {
 	objects = new Map<string, Uint8Array>();
 	uploads: string[] = [];
 	downloads: string[] = [];
+	uploadInfos: { path: string; index: number; total: number }[] = [];
 	failUpload = false;
 
-	async upload(data: ArrayBuffer, oid: string): Promise<void> {
+	async upload(data: ArrayBuffer, oid: string, info: { path: string; index: number; total: number }): Promise<void> {
+		this.uploadInfos.push(info);
 		if (this.failUpload) throw new Error("fake: upload failed");
 		this.uploads.push(oid);
 		this.objects.set(oid, new Uint8Array(data.slice(0)));
 	}
 
-	async download(oid: string, _size: number): Promise<ArrayBuffer> {
+	async download(oid: string, size: number, onProgress?: (done: number, total: number) => void): Promise<ArrayBuffer> {
 		this.downloads.push(oid);
 		const bytes = this.objects.get(oid);
 		if (!bytes) throw new Error(`fake: no LFS object ${oid}`);
+		onProgress?.(size, size);
 		return bytes.slice().buffer as ArrayBuffer;
 	}
 }

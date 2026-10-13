@@ -274,16 +274,21 @@ export async function uploadLfsObject(lfs: LfsClient, put: Uploader, data: Array
 
 const DOWNLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
 
-/** Batch download → ranged GETs of chunkBytes (default 8 MiB) → concatenate → SHA-256 must equal oid and length must equal size. Throws on any failure. */
+/**
+ * Batch download → ranged GETs of chunkBytes (default 8 MiB) → concatenate → SHA-256 must equal oid and length must equal size. Throws on any failure.
+ * onProgress gets (0, size) before the first request, then (bytes done, size) after each range or the one full 200.
+ */
 export async function downloadLfsObject(
 	lfs: LfsClient,
 	oid: string,
 	size: number,
 	chunkBytes = DOWNLOAD_CHUNK_BYTES,
+	onProgress?: (done: number, total: number) => void,
 ): Promise<ArrayBuffer> {
 	// One copy of the file plus one chunk in memory.
 	const out = new Uint8Array(size);
 	if (size > 0) {
+		onProgress?.(0, size);
 		const { actions } = await batchOrThrow(lfs, "download", oid, size);
 		if (!actions.download) throw new Error("LFS batch download failed: no download action");
 		for (let start = 0; start < size; start += chunkBytes) {
@@ -293,12 +298,14 @@ export async function downloadLfsObject(
 			// A server that ignores Range sends the whole file once, on the first request.
 			if (res.status === 200 && start === 0 && got === size) {
 				out.set(new Uint8Array(res.data));
+				onProgress?.(size, size);
 				break;
 			}
 			if (res.status !== 206 || got !== end - start + 1) {
 				throw new Error(`LFS download range ${start}-${end}: HTTP ${res.status} with ${got} bytes, expected ${end - start + 1}`);
 			}
 			out.set(new Uint8Array(res.data), start);
+			onProgress?.(end + 1, size);
 		}
 	}
 	const hash = await sha256Hex(out.buffer as ArrayBuffer);
