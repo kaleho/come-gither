@@ -1,4 +1,5 @@
 import { GitHubError } from "./github";
+import { gitattributesLine, lfsPointer, parseLfsPointer, sha256Hex } from "./lfs";
 import { isUtf8Text, threeWayMerge } from "./merge";
 import type { Files } from "./ports";
 import type { FileEntry, StateStore } from "./state";
@@ -31,6 +32,19 @@ export interface SyncConfig {
 	maxDeletions: number;
 	/** Asked before an over-threshold deletion. Absent = always defer. */
 	confirmDeletions?: (direction: "local" | "remote", paths: string[]) => Promise<DeletionDecision>;
+	/** Git LFS transfers (beta). Absent = LFS off: behavior is unchanged. */
+	lfs?: LfsOps;
+	/** New files over this go through LFS (default 100 MiB). */
+	lfsThresholdBytes?: number;
+	/** Files over this are never uploaded through LFS (default 2 GiB). */
+	maxLfsBytes?: number;
+}
+
+export interface LfsOps {
+	/** Stores the object on GitHub; throws on failure. */
+	upload(data: ArrayBuffer, oid: string): Promise<void>;
+	/** The object's verified content; throws on failure. */
+	download(oid: string, size: number): Promise<ArrayBuffer>;
 }
 
 export type DeletionDecision = "delete" | "keep" | "defer";
@@ -99,10 +113,15 @@ export type LogFn = (level: "info" | "warn" | "error", message: string) => void;
 /** git blob sha of empty content. */
 const EMPTY_BLOB_SHA = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
 
+const GITATTRIBUTES = ".gitattributes";
+/** LFS pointers are under 1024 bytes (spec v1). */
+const POINTER_MAX_BYTES = 1024;
+
 interface RemoteBlob {
 	sha: string;
 	size: number;
 	mode: string;
+	lfs?: { oid: string; size: number }; // the blob is an LFS pointer (detected only with LFS on)
 }
 
 /** A log-sized list: the first five paths, then an ellipsis. */
@@ -207,7 +226,7 @@ export class SyncEngine {
 			this.log("warn", `${path} was modified locally; not overwriting it with the remote content`);
 			return "modified";
 		}
-		const data = await this.gh.getBlobRaw(entry.baseBlobSha);
+		const data = await this.fetchContent(entry);
 		await this.files.writeBinary(path, data);
 		await this.record(path, entry.baseBlobSha, false, undefined, entry.mode);
 		await this.state.flush(); // a single-entry change never reaches the cadence threshold
@@ -227,7 +246,7 @@ export class SyncEngine {
 		// Persist the lazy intent BEFORE truncating: a crash between the two steps
 		// leaves a lazy entry (push skips those), never an empty file that a later
 		// push could mistake for an edit and upload over the real remote content.
-		await this.state.setFile(path, { baseBlobSha: entry.baseBlobSha, size: 0, mtime: 0, lazy: true, remoteSize, mode: entry.mode, keep: entry.keep });
+		await this.state.setFile(path, { baseBlobSha: entry.baseBlobSha, size: 0, mtime: 0, lazy: true, remoteSize, mode: entry.mode, keep: entry.keep, lfs: entry.lfs });
 		await this.state.flush();
 		await this.files.writeBinary(path, new ArrayBuffer(0));
 		await this.record(path, entry.baseBlobSha, true, remoteSize, entry.mode);
@@ -236,7 +255,7 @@ export class SyncEngine {
 		return "evicted";
 	}
 
-	/** Read-only classification of what the next sync would do. Fetches no blobs, writes nothing. */
+	/** Read-only classification of what the next sync would do. Writes nothing; fetches only tiny blobs to spot LFS pointers (LFS on). */
 	private async doPreview(): Promise<SyncPlan> {
 		const plan: SyncPlan = { headMoved: false, incoming: [], outgoing: [] };
 		const agreedDeleted = new Set<string>();
@@ -252,7 +271,7 @@ export class SyncEngine {
 				if (this.excluded(path)) continue;
 				const entry = this.state.state.files[path];
 				if (entry && entry.baseBlobSha === blob.sha) continue;
-				const { action } = await this.classifyIncoming(path, blob, entry, false);
+				const { action } = await this.classifyIncoming(path, (await this.detectLfs(blob)).blob, entry, false);
 				plan.incoming.push({ path, action });
 			}
 			const remoteLower = new Set([...remote.keys()].map((p) => p.toLowerCase()));
@@ -278,7 +297,7 @@ export class SyncEngine {
 			const stat = await this.files.stat(path);
 			if (!stat) continue;
 			if (entry && stat.mtime === entry.mtime && stat.size === entry.size) continue;
-			if (stat.size > this.config.maxPushBytes) {
+			if (stat.size > this.pushCap()) {
 				if (entry && stat.size === entry.size && (await this.localShaIfChanged(path, entry, false)) === "clean") {
 					continue; // only the mtime drifted; sync will heal it silently
 				}
@@ -343,7 +362,7 @@ export class SyncEngine {
 			await this.files.writeBinary(path, new ArrayBuffer(0));
 			await this.record(path, entry.baseBlobSha, true, entry.remoteSize, entry.mode);
 		} else {
-			const data = await this.gh.getBlobRaw(entry.baseBlobSha);
+			const data = await this.fetchContent(entry);
 			await this.files.writeBinary(path, data);
 			await this.record(path, entry.baseBlobSha, false, undefined, entry.mode);
 		}
@@ -355,7 +374,7 @@ export class SyncEngine {
 	private async doPush(): Promise<PushSummary> {
 		const summary: PushSummary = { pushed: 0, deletedRemote: 0, skipped: 0, skippedPaths: [], commit: null, readded: 0, restored: 0 };
 		const treeEntries: { path: string; mode: string; type: "blob"; sha: string | null }[] = [];
-		const fingerprints = new Map<string, { mtime: number; size: number; mode?: string }>();
+		const fingerprints = new Map<string, { mtime: number; size: number; mode?: string; lfs?: FileEntry["lfs"] }>();
 		const listLocal = async () => (await this.files.listRecursive("")).filter((p) => !this.excluded(p));
 		let listed = await listLocal();
 		// Decided before any upload. Placeholders are restored below, kept
@@ -375,7 +394,7 @@ export class SyncEngine {
 			const marked: Record<string, FileEntry> = {};
 			for (const p of guarded) {
 				const e = this.state.state.files[p];
-				marked[p] = { baseBlobSha: e.baseBlobSha, size: 0, mtime: 0, lazy: true, remoteSize: e.size, mode: e.mode };
+				marked[p] = { baseBlobSha: e.baseBlobSha, size: 0, mtime: 0, lazy: true, remoteSize: e.size, mode: e.mode, lfs: e.lfs };
 			}
 			await this.state.setFiles(marked);
 			let placeholders = 0;
@@ -385,6 +404,7 @@ export class SyncEngine {
 			this.log("info", `restored ${guarded.length} files here (${placeholders} as placeholders)`);
 			listed = await listLocal();
 		}
+		if (this.config.lfs && (await this.appendGitattributes(listed))) listed = await listLocal();
 		const localPaths = new Set(listed);
 
 		for (const path of localPaths) {
@@ -392,7 +412,7 @@ export class SyncEngine {
 			const stat = await this.files.stat(path);
 			if (!stat) continue; // removed while scanning
 			if (entry && stat.mtime === entry.mtime && stat.size === entry.size) continue;
-			if (stat.size > this.config.maxPushBytes) {
+			if (stat.size > this.pushCap()) {
 				// Checked before hashing: never read a file the API cannot accept.
 				// A same-size tracked file gets one confirming hash so a bare
 				// mtime drift heals instead of warning on every sync forever.
@@ -401,10 +421,15 @@ export class SyncEngine {
 				}
 				summary.skipped += 1;
 				summary.skippedPaths.push(path);
-				this.log("warn", `${path} is ${stat.size} bytes, over the push limit; push it from desktop git`);
+				this.log(
+					"warn",
+					this.config.lfs && stat.size > this.maxLfsBytes()
+						? `${path} is ${stat.size} bytes, over the 2 GB Git LFS limit; not pushing it`
+						: `${path} is ${stat.size} bytes, over the push limit; push it from desktop git`,
+				);
 				continue;
 			}
-			const localSha = await this.localShaIfChanged(path, entry);
+			const { sha: localSha, data: localData, oid } = await this.localState(path, entry);
 			if (localSha === "clean") continue;
 			if (entry?.lazy) {
 				summary.skipped += 1;
@@ -430,6 +455,31 @@ export class SyncEngine {
 					}
 					this.log("warn", `${path} differs from tracked ${twinKey} only by case; pushing it can create a case collision in the repository`);
 				}
+			}
+			if (oid !== undefined) {
+				// An LFS file: the bytes hashed above are the bytes uploaded, and
+				// the pointer is committed only after its object is stored.
+				const data = localData as ArrayBuffer;
+				if (!this.config.lfs) {
+					summary.skipped += 1;
+					summary.skippedPaths.push(path);
+					this.log("warn", `${path} is a Git LFS file; turn on beta features to push it`);
+					continue;
+				}
+				try {
+					await this.config.lfs.upload(data, oid);
+				} catch (e) {
+					summary.skipped += 1;
+					summary.skippedPaths.push(path);
+					this.log("warn", `${path}: LFS upload failed (${String(e)}); not pushing it this sync`);
+					continue;
+				}
+				const lfs = { oid, size: data.byteLength };
+				const pointerSha = await this.gh.createBlob(new TextEncoder().encode(lfsPointer(oid, lfs.size)).buffer as ArrayBuffer);
+				treeEntries.push({ path, mode: entry?.mode ?? "100644", type: "blob", sha: pointerSha });
+				fingerprints.set(path, { mtime: stat.mtime, size: stat.size, mode: entry?.mode, lfs });
+				summary.pushed += 1;
+				continue;
 			}
 			// One read serves both the cache key and the upload, so the cache can
 			// never map one file's content sha to another file's uploaded bytes.
@@ -529,9 +579,10 @@ export class SyncEngine {
 		}
 		for (const e of treeEntries) {
 			if (e.sha === null || readded.includes(e.path)) continue;
-			const fp = fingerprints.get(e.path) as { mtime: number; size: number; mode?: string };
+			const fp = fingerprints.get(e.path) as { mtime: number; size: number; mode?: string; lfs?: FileEntry["lfs"] };
 			const newEntry: FileEntry = { baseBlobSha: e.sha, size: fp.size, mtime: fp.mtime };
 			if (fp.mode !== undefined && fp.mode !== "100644") newEntry.mode = fp.mode;
+			if (fp.lfs) newEntry.lfs = fp.lfs;
 			await this.state.setFile(e.path, newEntry);
 		}
 		for (const path of droppedPaths) await this.state.removeFile(path);
@@ -647,7 +698,7 @@ export class SyncEngine {
 		entry: FileEntry | undefined,
 		refresh: boolean,
 	): Promise<{ action: IncomingAction; localSha: string }> {
-		const localSha = await this.localShaIfChanged(path, entry, refresh, blob.size);
+		const localSha = await this.localShaIfChanged(path, entry, refresh, blob.lfs?.size ?? blob.size, blob.lfs !== undefined);
 		if (localSha !== "clean") {
 			// Local content already equals the remote blob: adopt it.
 			if (localSha === blob.sha) return { action: "adopt", localSha };
@@ -661,18 +712,19 @@ export class SyncEngine {
 				return { action: "overwrite", localSha };
 			}
 		}
-		return { action: this.isLazyTarget(path, blob.size) ? "placeholder" : "fetch", localSha };
+		return { action: this.lazyBlob(path, blob) ? "placeholder" : "fetch", localSha };
 	}
 
 	private async applyRemoteChange(
 		path: string,
-		blob: RemoteBlob,
+		listed: RemoteBlob,
 		entry: FileEntry | undefined,
 		summary: PullSummary,
 	): Promise<void> {
+		const { blob, data: prefetched } = await this.detectLfs(listed);
 		const { action, localSha } = await this.classifyIncoming(path, blob, entry, true);
 		if (action === "adopt") {
-			await this.record(path, blob.sha, false, undefined, blob.mode);
+			await this.record(path, blob.sha, false, undefined, blob.mode, blob.lfs);
 			summary.adopted += 1;
 			return;
 		}
@@ -690,20 +742,20 @@ export class SyncEngine {
 		if (action === "overwrite" && localSha !== "missing") {
 			const why = this.inConfigDir(path) ? "the config folder always takes the GitHub version" : "policy: remote wins";
 			this.log("warn", `overwriting local changes to ${path} (${why})`);
-			if (this.isLazyTarget(path, blob.size)) {
+			if (this.lazyBlob(path, blob)) {
 				// The new state is a stub, so the changed local bytes would
 				// otherwise exist nowhere: keep a copy first.
 				const parked = await this.park(path, await this.files.readBinary(path));
 				this.log("warn", `saved the local version of ${path} to ${parked}`);
 			}
 		}
-		if (this.isLazyTarget(path, blob.size)) {
+		if (this.lazyBlob(path, blob)) {
 			await this.files.writeBinary(path, new ArrayBuffer(0));
-			await this.record(path, blob.sha, true, blob.size, blob.mode);
+			await this.record(path, blob.sha, true, blob.lfs?.size ?? blob.size, blob.mode, blob.lfs);
 			summary.placeholders += 1;
 			return;
 		}
-		const data = await this.gh.getBlobRaw(blob.sha);
+		const data = prefetched ?? (await this.gh.getBlobRaw(blob.sha));
 		await this.files.writeBinary(path, data);
 		await this.record(path, blob.sha, false, undefined, blob.mode);
 		summary.fetched += 1;
@@ -721,19 +773,23 @@ export class SyncEngine {
 			// Deleted here, changed on GitHub: the entry must describe GitHub's
 			// version, or a later Keep would restore the stale one as "synced".
 			this.log("info", `${path}: deleted here, changed on GitHub; now tracking GitHub's version`);
-			await this.state.setFile(
-				path,
-				entry.lazy ? { ...entry, baseBlobSha: blob.sha, remoteSize: blob.size } : { ...entry, baseBlobSha: blob.sha, size: blob.size },
-			);
+			const next: FileEntry = entry.lazy
+				? { ...entry, baseBlobSha: blob.sha, remoteSize: blob.lfs?.size ?? blob.size }
+				: { ...entry, baseBlobSha: blob.sha, size: blob.size };
+			if (blob.lfs) next.lfs = blob.lfs;
+			else delete next.lfs;
+			await this.state.setFile(path, next);
 		}
-		if (blob.size > this.config.maxAutoFetchBytes) {
-			// Never buffer an oversize blob just to record a conflict.
+		if (blob.lfs || blob.size > this.config.maxAutoFetchBytes) {
+			// Never buffer an oversize blob just to record a conflict, and never
+			// park an LFS pointer's text as if it were the file.
 			summary.conflicts += 1;
 			this.log("warn", `conflict on ${path}: the GitHub version is too large to save locally; resolve it from desktop git`);
 			return;
 		}
 		const remoteData = await this.gh.getBlobRaw(blob.sha);
-		if (entry && localSha !== "missing") {
+		if (entry && localSha !== "missing" && !entry.lfs) {
+			// (An LFS base is pointer text: never merged.)
 			const baseData = await this.gh.getBlobRaw(entry.baseBlobSha);
 			const localData = await this.files.readBinary(path);
 			if (isUtf8Text(baseData) && isUtf8Text(localData) && isUtf8Text(remoteData)) {
@@ -839,7 +895,7 @@ export class SyncEngine {
 	private async restoreLocal(path: string): Promise<boolean> {
 		const entry = this.state.state.files[path];
 		const size = entry.remoteSize as number;
-		if (this.isLazyTarget(path, size)) {
+		if (entry.lfs !== undefined || this.isLazyTarget(path, size)) {
 			await this.files.writeBinary(path, new ArrayBuffer(0));
 			await this.record(path, entry.baseBlobSha, true, size, entry.mode);
 			return true;
@@ -858,37 +914,146 @@ export class SyncEngine {
 		entry: FileEntry | undefined,
 		refresh = true,
 		expectedSize?: number,
+		remoteLfs = false,
 	): Promise<string> {
+		return (await this.localState(path, entry, refresh, expectedSize, remoteLfs)).sha;
+	}
+
+	/**
+	 * localShaIfChanged plus the bytes it read and, for an LFS file, the oid.
+	 * An LFS file's sha is its virtual one: the sha its pointer blob would
+	 * have, so every comparison against baseBlobSha and remote shas holds.
+	 */
+	private async localState(
+		path: string,
+		entry: FileEntry | undefined,
+		refresh = true,
+		expectedSize?: number,
+		remoteLfs = false,
+	): Promise<{ sha: string; data?: ArrayBuffer; oid?: string }> {
 		const stat = await this.files.stat(path);
 		if (!entry) {
-			if (!stat) return "clean"; // nothing local, nothing tracked
+			if (!stat) return { sha: "clean" }; // nothing local, nothing tracked
 			if (expectedSize !== undefined && stat.size !== expectedSize && stat.size > this.config.maxPushBytes) {
 				// The sizes differ, so the contents cannot match: never buffer a
 				// huge untracked file just to prove it (iPad memory).
-				return "size-differs";
+				return { sha: "size-differs" };
 			}
-			return gitBlobSha1(await this.files.readBinary(path));
+			const data = await this.files.readBinary(path);
+			return { ...(await this.contentSha(data, remoteLfs || this.lfsBySize(path, stat.size))), data };
 		}
-		if (!stat) return "missing";
-		if (stat.mtime === entry.mtime && stat.size === entry.size) return "clean";
-		const sha = await gitBlobSha1(await this.files.readBinary(path));
+		if (!stat) return { sha: "missing" };
+		if (stat.mtime === entry.mtime && stat.size === entry.size) return { sha: "clean" };
+		const data = await this.files.readBinary(path);
+		let hashed = await this.contentSha(data, entry.lfs !== undefined);
+		const sha = hashed.sha;
 		if (sha === entry.baseBlobSha) {
 			// The full content is present. Recording lazy=false also heals a
 			// stale lazy flag left by an interrupted evict or download, which
 			// would otherwise strand every later edit as a "modified placeholder".
 			if (refresh) await this.record(path, entry.baseBlobSha, false, undefined, entry.mode);
-			return "clean";
+			return { sha: "clean" };
 		}
 		// A lazy entry whose content is still empty is an untouched stub whose
 		// mtime drifted (backup restore, file-provider touch): clean, re-stamp.
 		if (entry.lazy === true && sha === EMPTY_BLOB_SHA) {
 			if (refresh) await this.record(path, entry.baseBlobSha, true, entry.remoteSize, entry.mode);
-			return "clean";
+			return { sha: "clean" };
 		}
-		return sha;
+		// A normal file that now goes to LFS (GitHub holds a pointer, or it
+		// grew past the threshold) compares by its virtual sha.
+		if (hashed.oid === undefined && (remoteLfs || this.lfsBySize(path, stat.size))) hashed = await this.contentSha(data, true);
+		return { ...hashed, data };
 	}
 
-	private async record(path: string, sha: string, lazy: boolean, remoteSize?: number, mode?: string): Promise<void> {
+	/** git blob sha of local bytes; for an LFS file, the sha of the pointer blob it would have. */
+	private async contentSha(data: ArrayBuffer, lfs: boolean): Promise<{ sha: string; oid?: string }> {
+		// git-lfs never makes a pointer for empty content.
+		if (!lfs || data.byteLength === 0) return { sha: await gitBlobSha1(data) };
+		const oid = await sha256Hex(data);
+		const pointer = new TextEncoder().encode(lfsPointer(oid, data.byteLength)).buffer as ArrayBuffer;
+		return { sha: await gitBlobSha1(pointer), oid };
+	}
+
+	/**
+	 * With LFS on, a changed remote blob small enough to be a pointer is
+	 * fetched and checked. Callers skip blobs whose sha matches the entry, so
+	 * an unchanged pointer is never refetched; the bytes come back for reuse.
+	 */
+	private async detectLfs(blob: RemoteBlob): Promise<{ blob: RemoteBlob; data?: ArrayBuffer }> {
+		if (!this.config.lfs || blob.size >= POINTER_MAX_BYTES) return { blob };
+		const data = await this.gh.getBlobRaw(blob.sha);
+		const lfs = parseLfsPointer(data);
+		return { blob: lfs ? { ...blob, lfs } : blob, data };
+	}
+
+	/**
+	 * Appends the exact-path LFS line for each file this push may send through
+	 * LFS, BEFORE the scan, so .gitattributes rides in the same commit as an
+	 * ordinary changed file. Candidates come from stat alone (fingerprint
+	 * changed, within the caps, and a downloaded LFS entry or over the
+	 * threshold), so no file is read here: a line for a file whose upload then
+	 * fails, or whose mtime only drifted, is harmless (DEC-0002). Append-only.
+	 * True when written.
+	 */
+	private async appendGitattributes(paths: string[]): Promise<boolean> {
+		const lines: string[] = [];
+		for (const path of paths) {
+			const entry = this.state.state.files[path];
+			const stat = await this.files.stat(path);
+			if (!stat || (entry && stat.mtime === entry.mtime && stat.size === entry.size)) continue;
+			// A placeholder is never uploaded (a drifted stub would add a line for nothing).
+			if (stat.size <= this.pushCap() && ((entry?.lfs !== undefined && !entry.lazy) || this.lfsBySize(path, stat.size))) {
+				lines.push(gitattributesLine(path));
+			}
+		}
+		if (lines.length === 0) return false;
+		await this.doFetchLazy(GITATTRIBUTES); // a placeholder's real lines come first
+		const existing = (await this.files.stat(GITATTRIBUTES))
+			? new TextDecoder().decode(await this.files.readBinary(GITATTRIBUTES))
+			: "";
+		const have = new Set(existing.split(/\r?\n/));
+		const add = lines.filter((l) => !have.has(l));
+		if (add.length === 0) return false;
+		const sep = existing === "" || existing.endsWith("\n") ? "" : "\n";
+		await this.files.writeBinary(GITATTRIBUTES, new TextEncoder().encode(`${existing}${sep}${add.join("\n")}\n`).buffer as ArrayBuffer);
+		return true;
+	}
+
+	/** An entry's real content: from LFS for an LFS file, else its git blob. */
+	private fetchContent(entry: FileEntry): Promise<ArrayBuffer> {
+		if (!entry.lfs) return this.gh.getBlobRaw(entry.baseBlobSha);
+		if (!this.config.lfs) throw new Error("this is a Git LFS file; turn on beta features to download it");
+		return this.config.lfs.download(entry.lfs.oid, entry.lfs.size);
+	}
+
+	private maxLfsBytes(): number {
+		return this.config.maxLfsBytes ?? 2 * 1024 ** 3;
+	}
+
+	/** The largest file a push reads: the upload limit, and with LFS on, the LFS limit. */
+	private pushCap(): number {
+		return this.config.lfs ? Math.min(this.config.maxPushBytes, this.maxLfsBytes()) : this.config.maxPushBytes;
+	}
+
+	/** A file new to LFS: over the threshold. Never .gitattributes, which git reads unfiltered. */
+	private lfsBySize(path: string, size: number): boolean {
+		return this.config.lfs !== undefined && path !== GITATTRIBUTES && size > (this.config.lfsThresholdBytes ?? 100 * 1048576);
+	}
+
+	/** Pulled as a placeholder: LFS pointers always, else the size and type rule. */
+	private lazyBlob(path: string, blob: RemoteBlob): boolean {
+		return blob.lfs !== undefined || this.isLazyTarget(path, blob.size);
+	}
+
+	private async record(
+		path: string,
+		sha: string,
+		lazy: boolean,
+		remoteSize?: number,
+		mode?: string,
+		lfs?: FileEntry["lfs"],
+	): Promise<void> {
 		// Only ever called right after a write or on an existing file.
 		const stat = (await this.files.stat(path)) as { mtime: number; size: number };
 		const entry: FileEntry = {
@@ -904,6 +1069,9 @@ export class SyncEngine {
 		// Same blob, same decision: a download, evict or revert of a kept file keeps it marked.
 		const prev = this.state.state.files[path];
 		if (prev?.keep && prev.baseBlobSha === sha) entry.keep = true;
+		// Same pointer blob, same LFS object.
+		const sameLfs = lfs ?? (prev?.baseBlobSha === sha ? prev.lfs : undefined);
+		if (sameLfs) entry.lfs = sameLfs;
 		await this.state.setFile(path, entry);
 	}
 

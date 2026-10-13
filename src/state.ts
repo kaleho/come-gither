@@ -8,6 +8,7 @@ export interface FileEntry {
 	remoteSize?: number; // set on lazy entries: the real file's size on GitHub
 	mode?: string; // git mode when not the default "100644" (e.g. "100755")
 	keep?: true; // absent on GitHub by the user's Keep; the next push adds it back by baseBlobSha
+	lfs?: { oid: string; size: number }; // an LFS file: baseBlobSha is the POINTER blob's sha
 }
 
 export interface SyncState {
