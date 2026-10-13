@@ -125,7 +125,7 @@ interface RemoteBlob {
 	sha: string;
 	size: number;
 	mode: string;
-	lfs?: { oid: string; size: number }; // the blob is an LFS pointer (detected only with LFS on)
+	lfs?: { oid: string; size: number }; // the blob is an LFS pointer (detected with LFS on, or over an LFS entry)
 }
 
 /** A log-sized list: the first five paths, then an ellipsis. */
@@ -231,9 +231,9 @@ export class SyncEngine {
 			this.log("warn", `${path} was modified locally; not overwriting it with the remote content`);
 			return "modified";
 		}
-		const data = await this.fetchContent(entry, onProgress);
+		const { data, lfs } = await this.fetchContent(entry, onProgress);
 		await this.files.writeBinary(path, data);
-		await this.record(path, entry.baseBlobSha, false, undefined, entry.mode);
+		await this.record(path, entry.baseBlobSha, false, undefined, entry.mode, lfs);
 		await this.state.flush(); // a single-entry change never reaches the cadence threshold
 		this.log("info", `fetched ${path} (${data.byteLength} bytes)`);
 		return "fetched";
@@ -276,7 +276,7 @@ export class SyncEngine {
 				if (this.excluded(path)) continue;
 				const entry = this.state.state.files[path];
 				if (entry && entry.baseBlobSha === blob.sha) continue;
-				const { action } = await this.classifyIncoming(path, (await this.detectLfs(blob)).blob, entry, false);
+				const { action } = await this.classifyIncoming(path, (await this.detectLfs(blob, entry)).blob, entry, false);
 				plan.incoming.push({ path, action });
 			}
 			const remoteLower = new Set([...remote.keys()].map((p) => p.toLowerCase()));
@@ -367,9 +367,9 @@ export class SyncEngine {
 			await this.files.writeBinary(path, new ArrayBuffer(0));
 			await this.record(path, entry.baseBlobSha, true, entry.remoteSize, entry.mode);
 		} else {
-			const data = await this.fetchContent(entry);
+			const { data, lfs } = await this.fetchContent(entry);
 			await this.files.writeBinary(path, data);
-			await this.record(path, entry.baseBlobSha, false, undefined, entry.mode);
+			await this.record(path, entry.baseBlobSha, false, undefined, entry.mode, lfs);
 		}
 		await this.state.flush();
 		this.log("info", `reverted ${path} to its last-synced content`);
@@ -463,10 +463,12 @@ export class SyncEngine {
 					this.log("warn", `${path} differs from tracked ${twinKey} only by case; pushing it can create a case collision in the repository`);
 				}
 			}
+			// One read serves the change check, the cache key and the upload,
+			// so the cache can never map one file's content sha to another
+			// file's uploaded bytes, and a push holds one buffer per file.
+			const data = localData as ArrayBuffer;
 			if (oid !== undefined) {
-				// An LFS file: the bytes hashed above are the bytes uploaded, and
-				// the pointer is committed only after its object is stored.
-				const data = localData as ArrayBuffer;
+				// An LFS file: the pointer is committed only after its object is stored.
 				if (!this.config.lfs) {
 					summary.skipped += 1;
 					summary.skippedPaths.push(path);
@@ -490,9 +492,6 @@ export class SyncEngine {
 				summary.pushed += 1;
 				continue;
 			}
-			// One read serves both the cache key and the upload, so the cache can
-			// never map one file's content sha to another file's uploaded bytes.
-			const data = await this.files.readBinary(path);
 			const contentSha = await gitBlobSha1(data);
 			let sha = this.uploadedBlobs.get(contentSha);
 			if (sha === undefined) {
@@ -730,7 +729,7 @@ export class SyncEngine {
 		entry: FileEntry | undefined,
 		summary: PullSummary,
 	): Promise<void> {
-		const { blob, data: prefetched } = await this.detectLfs(listed);
+		const { blob, data: prefetched } = await this.detectLfs(listed, entry);
 		const { action, localSha } = await this.classifyIncoming(path, blob, entry, true);
 		if (action === "adopt") {
 			await this.record(path, blob.sha, false, undefined, blob.mode, blob.lfs);
@@ -784,7 +783,7 @@ export class SyncEngine {
 			this.log("info", `${path}: deleted here, changed on GitHub; now tracking GitHub's version`);
 			const next: FileEntry = entry.lazy
 				? { ...entry, baseBlobSha: blob.sha, remoteSize: blob.lfs?.size ?? blob.size }
-				: { ...entry, baseBlobSha: blob.sha, size: blob.size };
+				: { ...entry, baseBlobSha: blob.sha, size: blob.lfs?.size ?? blob.size };
 			if (blob.lfs) next.lfs = blob.lfs;
 			else delete next.lfs;
 			await this.state.setFile(path, next);
@@ -969,6 +968,9 @@ export class SyncEngine {
 			if (refresh) await this.record(path, entry.baseBlobSha, true, entry.remoteSize, entry.mode);
 			return { sha: "clean" };
 		}
+		// An LFS file against a plain remote blob (pull, preview): only its
+		// plain sha can match, and equal content then adopts.
+		if (entry.lfs !== undefined && expectedSize !== undefined && !remoteLfs) return { sha: await gitBlobSha1(data), data };
 		// A normal file that now goes to LFS (GitHub holds a pointer, or it
 		// grew past the threshold) compares by its virtual sha.
 		if (hashed.oid === undefined && (remoteLfs || this.lfsBySize(path, stat.size))) hashed = await this.contentSha(data, true);
@@ -985,12 +987,13 @@ export class SyncEngine {
 	}
 
 	/**
-	 * With LFS on, a changed remote blob small enough to be a pointer is
-	 * fetched and checked. Callers skip blobs whose sha matches the entry, so
+	 * With LFS on, or for an entry that is an LFS file (parse only, so LFS
+	 * off still never writes pointer text over it), a changed remote blob
+	 * small enough to be a pointer is fetched and checked. Callers skip blobs whose sha matches the entry, so
 	 * an unchanged pointer is never refetched; the bytes come back for reuse.
 	 */
-	private async detectLfs(blob: RemoteBlob): Promise<{ blob: RemoteBlob; data?: ArrayBuffer }> {
-		if (!this.config.lfs || blob.size >= POINTER_MAX_BYTES) return { blob };
+	private async detectLfs(blob: RemoteBlob, entry: FileEntry | undefined): Promise<{ blob: RemoteBlob; data?: ArrayBuffer }> {
+		if (!(this.config.lfs || entry?.lfs) || blob.size >= POINTER_MAX_BYTES) return { blob };
 		const data = await this.gh.getBlobRaw(blob.sha);
 		const lfs = parseLfsPointer(data);
 		return { blob: lfs ? { ...blob, lfs } : blob, data };
@@ -1020,28 +1023,48 @@ export class SyncEngine {
 	 * Appends the exact-path LFS line for each candidate BEFORE the scan, so
 	 * .gitattributes rides in the same commit as an ordinary changed file. A
 	 * line for a file whose upload then fails, or whose mtime only drifted, is
-	 * harmless (DEC-0002). Append-only. True when written.
+	 * harmless (DEC-0002). Append-only, byte for byte. True when written.
 	 */
 	private async appendGitattributes(candidates: string[]): Promise<boolean> {
 		const lines = candidates.map((p) => gitattributesLine(p));
 		if (lines.length === 0) return false;
 		await this.doFetchLazy(GITATTRIBUTES); // a placeholder's real lines come first
-		const existing = (await this.files.stat(GITATTRIBUTES))
-			? new TextDecoder().decode(await this.files.readBinary(GITATTRIBUTES))
-			: "";
+		const raw = (await this.files.stat(GITATTRIBUTES))
+			? new Uint8Array(await this.files.readBinary(GITATTRIBUTES))
+			: new Uint8Array(0);
+		// Decoded only to dedupe and to match line endings: the original
+		// bytes (a BOM, invalid UTF-8) are written back untouched.
+		const existing = new TextDecoder().decode(raw);
 		const have = new Set(existing.split(/\r?\n/));
 		const add = lines.filter((l) => !have.has(l));
 		if (add.length === 0) return false;
-		const sep = existing === "" || existing.endsWith("\n") ? "" : "\n";
-		await this.files.writeBinary(GITATTRIBUTES, new TextEncoder().encode(`${existing}${sep}${add.join("\n")}\n`).buffer as ArrayBuffer);
+		const eol = existing.includes("\r\n") ? "\r\n" : "\n";
+		const sep = raw.length === 0 || existing.endsWith("\n") ? "" : eol;
+		const tail = new TextEncoder().encode(`${sep}${add.join(eol)}${eol}`);
+		const out = new Uint8Array(raw.length + tail.length);
+		out.set(raw);
+		out.set(tail, raw.length);
+		await this.files.writeBinary(GITATTRIBUTES, out.buffer);
 		return true;
 	}
 
-	/** An entry's real content: from LFS for an LFS file, else its git blob. */
-	private fetchContent(entry: FileEntry, onProgress?: (done: number, total: number) => void): Promise<ArrayBuffer> {
-		if (!entry.lfs) return this.gh.getBlobRaw(entry.baseBlobSha);
+	/**
+	 * An entry's real content: from LFS for an LFS file, else its git blob.
+	 * With LFS on, a blob that is a pointer (pulled while LFS was off) is
+	 * downloaded instead, and its lfs comes back for the entry.
+	 */
+	private async fetchContent(
+		entry: FileEntry,
+		onProgress?: (done: number, total: number) => void,
+	): Promise<{ data: ArrayBuffer; lfs?: FileEntry["lfs"] }> {
+		let lfs = entry.lfs;
+		if (!lfs) {
+			const data = await this.gh.getBlobRaw(entry.baseBlobSha);
+			lfs = (this.config.lfs && parseLfsPointer(data)) || undefined;
+			if (!lfs) return { data };
+		}
 		if (!this.config.lfs) throw new Error("this is a Git LFS file; turn on beta features to download it");
-		return this.config.lfs.download(entry.lfs.oid, entry.lfs.size, onProgress);
+		return { data: await this.config.lfs.download(lfs.oid, lfs.size, onProgress), lfs };
 	}
 
 	private maxLfsBytes(): number {
