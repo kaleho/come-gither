@@ -40,7 +40,11 @@ Research lane, 2026-10-13 (sources in the lane report; summary here):
 
 Spike must settle: (1) 114 MB single PUT to S3 on the iPad — via requestUrl, and via `fetch` if S3 answers CORS for the app origin; (2) fine-grained PAT on the batch API; (3) REST-committed pointer recognised as LFS, with/without .gitattributes; (4) verify via requestUrl; (5) ranged download + on-device SHA-256; (6) SHA-256 of 114 MB on the iPad (crypto.subtle needs the whole buffer).
 
+iPad spike result (0.6.0 beta "Test large file support", 2026-10-13, user report): ALL 7 STEPS PASSED with the 114 MB file — hash, batch upload, upload, verify, pointer commit, download check (1 MiB range match), cleanup.
+- Settled: a ~114 MB single PUT to LFS storage works on the iPad; the configured token can use the LFS batch API; on-device SHA-256 of 114 MB works; the object is stored and downloadable by range.
+- Still open: which uploader succeeded (fetch or requestUrl); hash time; whether GitHub's web UI / raw endpoint treats the REST-committed pointer as LFS (the test checks the object, not the pointer's recognition — branch deleted after).
+
 ## Decisions (in flight)
 
 ## Next
-- Research done. Next: design the iPad spike (see the six items above).
+- iPad spike passed. Next: get the step details from the log; then scope real LFS sync (push over-limit files to LFS, pull pointers as placeholders, .gitattributes) as a FEAT.
