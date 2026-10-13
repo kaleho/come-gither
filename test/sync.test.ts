@@ -689,6 +689,21 @@ describe("blob cache integrity", () => {
 		await second;
 		expect(gh.createBlobCalls).toBe(1);
 	});
+	it("reads each pushed file once", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "a.md": "one" });
+		await engine.pull();
+		await files.writeBinary("a.md", text("two"));
+		await files.writeBinary("b.md", text("new"));
+		const reads: string[] = [];
+		const orig = files.readBinary.bind(files);
+		files.readBinary = async (p) => {
+			reads.push(p);
+			return orig(p);
+		};
+		await engine.push();
+		expect(reads.filter((p) => p === "a.md" || p === "b.md").sort()).toEqual(["a.md", "b.md"]);
+	});
 });
 
 describe("lazy entry healing", () => {
@@ -2531,6 +2546,92 @@ describe("LFS (beta)", () => {
 				{ path: "huge.bin", action: "skip-oversize", size: 60 },
 				{ path: "new.bin", action: "new" },
 			]);
+		});
+	});
+
+	describe("review fixes", () => {
+		it("a placeholder pulled with LFS off downloads through LFS once LFS is on, never as pointer text", async () => {
+			const env = lfsEngine();
+			const real = blob(500, 9);
+			env.lfs.objects.set(await oidOf(real), real);
+			await env.gh.setFiles({ "v.mp4": await pointerOf(real) });
+			await lfsOff(env).engine.pull();
+			await env.engine.sync();
+			expect(await env.engine.fetchLazy("v.mp4")).toBe("fetched");
+			expect(new Uint8Array(await env.files.readBinary("v.mp4"))).toEqual(real);
+			expect(env.state.state.files["v.mp4"].lfs).toEqual({ oid: await oidOf(real), size: 500 });
+			expect((await env.engine.push()).commit).toBe(null);
+		});
+
+		it("a pull with LFS off turns a changed pointer of an LFS file into an LFS placeholder, never pointer text", async () => {
+			const env = lfsEngine();
+			const a = blob(300, 65);
+			const b = blob(301, 66);
+			env.lfs.objects.set(await oidOf(a), a);
+			env.lfs.objects.set(await oidOf(b), b);
+			await env.gh.setFiles({ "n.md": await pointerOf(a) });
+			await env.engine.pull();
+			await env.engine.fetchLazy("n.md");
+			await env.gh.setFiles({ "n.md": await pointerOf(b) });
+			await lfsOff(env).engine.pull();
+			expect((await env.files.stat("n.md"))?.size).toBe(0);
+			expect(env.state.state.files["n.md"]).toMatchObject({ lazy: true, remoteSize: 301, lfs: { oid: await oidOf(b), size: 301 } });
+			await env.engine.sync();
+			expect(await env.engine.fetchLazy("n.md")).toBe("fetched");
+			expect(new Uint8Array(await env.files.readBinary("n.md"))).toEqual(b);
+		});
+
+		it("keeps a UTF-8 BOM in .gitattributes (append-only bytes)", async () => {
+			const { gh, files, engine } = lfsEngine();
+			const bom = new Uint8Array([0xef, 0xbb, 0xbf, ...new TextEncoder().encode("*.psd binary\n")]);
+			await gh.setFiles({ [ATTR]: bom, "a.md": "x" });
+			await engine.pull();
+			await files.writeBinary("big.bin", buf(blob(20)));
+			await engine.push();
+			expect(new Uint8Array(await files.readBinary(ATTR))).toEqual(
+				new Uint8Array([...bom, ...new TextEncoder().encode(`${gitattributesLine("big.bin")}\n`)]),
+			);
+		});
+
+		it("keeps invalid UTF-8 bytes in .gitattributes", async () => {
+			const { gh, files, engine } = lfsEngine();
+			const raw = new Uint8Array([...new TextEncoder().encode("# caf"), 0xe9, 0x0a]);
+			await gh.setFiles({ [ATTR]: raw, "a.md": "x" });
+			await engine.pull();
+			await files.writeBinary("big.bin", buf(blob(20)));
+			await engine.push();
+			expect([...new Uint8Array(await files.readBinary(ATTR)).slice(0, raw.length)]).toEqual([...raw]);
+		});
+
+		it("appends with CRLF to a CRLF .gitattributes", async () => {
+			const { gh, files, engine } = lfsEngine();
+			await gh.setFiles({ [ATTR]: "*.psd binary\r\n", "a.md": "x" });
+			await engine.pull();
+			await files.writeBinary("big.bin", buf(blob(20)));
+			await engine.push();
+			expect(files.readText(ATTR)).toBe(`*.psd binary\r\n${gitattributesLine("big.bin")}\r\n`);
+		});
+
+		it("adopts a local LFS file edited to exactly the plain blob now on GitHub", async () => {
+			const { gh, files, state, engine } = lfsEngine();
+			await gh.setFiles({ "a.md": "x" });
+			await engine.pull();
+			await files.writeBinary("n.md", text("long enough lfs text"));
+			await engine.push();
+			await files.writeBinary("n.md", text("short"));
+			await gh.setFiles({ ...Object.fromEntries([...gh.filesByPath].map(([p, f]) => [p, f.bytes])), "n.md": "short" });
+			const summary = await engine.pull();
+			expect(summary).toMatchObject({ conflicts: 0, adopted: 1 });
+			expect(state.state.files["n.md"].lfs).toBeUndefined();
+		});
+
+		it("records the real size when a downloaded LFS file is deleted here and changed on GitHub", async () => {
+			const { gh, files, state, engine } = await pushedLfsFile({ maxDeletions: 0, confirmDeletions: async () => "keep" });
+			await files.remove("big.bin");
+			const next = blob(40, 3);
+			await gh.setFiles({ ...Object.fromEntries([...gh.filesByPath].map(([p, f]) => [p, f.bytes])), "big.bin": await pointerOf(next) });
+			await engine.sync();
+			expect(state.state.files["big.bin"]).toMatchObject({ lazy: true, remoteSize: 40 });
 		});
 	});
 });
