@@ -1,12 +1,14 @@
 ---
 id: FEAT-0010-4412AF1C
-status: proposed
+status: done
 created: '2026-10-13T19:57:33+00:00'
-updated: '2026-10-13T19:57:33+00:00'
+updated: '2026-10-13T20:28:28+00:00'
 advances: []
 verifies: []
-derived_from: [SES-0001]
-related: [FEAT-0009]
+derived_from:
+- SES-0001
+related:
+- FEAT-0009
 branches:
 - records/lfs-progress
 external: {}

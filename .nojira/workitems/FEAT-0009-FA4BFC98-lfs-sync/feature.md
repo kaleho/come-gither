@@ -1,12 +1,16 @@
 ---
 id: FEAT-0009-FA4BFC98
-status: proposed
+status: done
 created: '2026-10-13T19:14:35+00:00'
-updated: '2026-10-13T19:14:35+00:00'
+updated: '2026-10-13T20:28:28+00:00'
 advances: []
 verifies: []
-derived_from: [SES-0001]
-related: [FND-0001, FEAT-0008, DEC-0002]
+derived_from:
+- SES-0001
+related:
+- FND-0001
+- FEAT-0008
+- DEC-0002
 branches:
 - records/lfs-sync-feat
 external: {}
