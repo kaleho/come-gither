@@ -15,6 +15,7 @@ Real git implementations struggle on mobile with large repositories. Come Gither
 - **Preview before you sync.** The command *Preview sync* lists incoming and outgoing changes. Each outgoing change has a Revert button.
 - **Safe interruption.** A killed or backgrounded pull resumes where it stopped. An interrupted upload restarts, but nothing appears on GitHub until the final commit lands.
 - **Log export.** The command *Export sync log* writes the sync log to a note, so you can share it from any device.
+- **Ribbon menu.** The Come Gither icon in the ribbon opens a menu: *Sync now*, *Preview sync*, *Export sync log*, *Show beta features*, and each beta command when beta features are on.
 
 ## Network use disclosure
 
@@ -42,6 +43,17 @@ The first sync of a large vault takes a while and is safe to interrupt. Start it
 - **Automatic sync interval (minutes)** — 0 is off; otherwise 3 to 60.
 - **Pull when Obsidian starts** — on by default. The startup pull never pushes; local edits and deletions wait for a manual or interval sync.
 - **Deletion guard threshold** — 10 by default. A pull that would delete more files than this on the device, or a push that would delete more than this on GitHub, stops and asks first. Automatic and startup syncs pause instead until you run **Sync now**. 0 turns the guard off.
+- **Enable beta features** — off by default. Turns on unfinished features. They may change or break.
+
+## Beta features
+
+Beta features are unfinished. Each one lists what it does and what it writes. Read the list before you turn on **Enable beta features**. You can see the list in three places:
+
+- The plugin's settings page, under the toggle.
+- The command **Show beta features**.
+- The ribbon icon menu, item *Show beta features*.
+
+While beta features are off, their commands do not show in the command palette or the ribbon menu.
 
 ## Limits
 
