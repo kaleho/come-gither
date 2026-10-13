@@ -665,14 +665,12 @@ export default class ComeGitherPlugin extends Plugin {
 					this.unattended,
 					() => new Promise((resolve) => new ConfirmDeletionsModal(this.app, direction, paths, resolve).open()),
 				),
-			// Beta only. Toggling beta saves settings, which retires this engine
-			// and rebuilds it on next use, so no restart is needed.
-			...(this.settings.betaFeatures ? { lfs: this.lfsOps() } : {}),
+			lfs: this.lfsOps(),
 		});
 		return { engine, state };
 	}
 
-	/** LFS transfers for sync (beta). Uploads use requestUrl only: storage CORS blocks fetch (DEC-0002). */
+	/** LFS transfers for sync. Uploads use requestUrl only: storage CORS blocks fetch (DEC-0002). */
 	private lfsOps(): LfsOps {
 		// No cache-buster on LFS traffic: it breaks presigned storage URLs.
 		const rawHttp = new ObsidianHttp({ bustCache: false });
@@ -1024,7 +1022,7 @@ export default class ComeGitherPlugin extends Plugin {
 }
 
 const UPLOAD_DESC =
-	'Files above this size are skipped on push. GitHub refuses files over 100 MB unless the beta "Sync large files with Git LFS" is on (LFS limit: 2 GB). A large upload can run out of memory on a phone.';
+	"Files above this size are skipped on push. Files over 100 MB go to GitHub through Git LFS (limit: 2 GB). A large upload can run out of memory on a phone.";
 
 const BETA_DESC =
 	"Turns on unfinished features listed below. They may change or break; read what each one does before you turn this on.";

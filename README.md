@@ -16,12 +16,13 @@ Real git implementations struggle on mobile with large repositories. Come Gither
 - **Safe interruption.** A killed or backgrounded pull resumes where it stopped. An interrupted upload restarts, but nothing appears on GitHub until the final commit lands.
 - **Log export.** The command *Export sync log* writes the sync log to a note, so you can share it from any device.
 - **Ribbon menu.** The Come Gither icon in the ribbon opens a menu: *Sync now*, *Preview sync*, *Export sync log*, *Show beta features*, and each beta command when beta features are on.
+- **Large files through Git LFS.** Files over 100 MB, up to 2 GB, go to GitHub through Git LFS. Raise **Largest upload (MB)** above 100 to push them. An LFS file you edit stays in LFS at any size. LFS files from GitHub arrive as placeholders and download when you open them. A notice shows the progress of each LFS upload and download. The sync commit adds one line per file to `.gitattributes` and never removes lines. LFS files count toward your LFS quota (10 GiB storage and 10 GiB download per month included on Free and Pro). Desktop git needs [git-lfs](https://git-lfs.com) installed to see these files.
 
 ## Network use disclosure
 
 This plugin sends the contents of your vault to the GitHub API (`api.github.com`) and downloads repository content from it. It collects no telemetry.
 
-The beta command *Test large file support* also contacts GitHub's Git LFS endpoint (`github.com`, `lfs.github.com`) and the storage URLs GitHub returns for the upload and download (currently Amazon S3 hosts run by GitHub). It runs only when beta features are on and you start the command. While beta features are on, sync also contacts the same hosts (`github.com`, `lfs.github.com`, and GitHub's storage URLs) to upload and download Git LFS files (see *Sync large files with Git LFS*). Nothing else talks to any other service.
+Sync also contacts GitHub's Git LFS endpoint (`github.com`, `lfs.github.com`) and the storage URLs GitHub returns (currently Amazon S3 hosts run by GitHub) to upload and download Git LFS files. The beta command *Test large file support* contacts the same hosts, only when beta features are on and you start the command. Nothing else talks to any other service.
 
 ## Token storage disclosure
 
@@ -41,7 +42,7 @@ The first sync of a large vault takes a while and is safe to interrupt. Start it
 - **Conflict policy** — merge (default) or remote wins.
 - **Placeholder downloads** — ask first (default) or download immediately.
 - **Largest automatic download (MB)** — text files above this size, and all binary files, stay placeholders until you open them.
-- **Largest upload (MB)** — files above this size are skipped on push. The default is 30. GitHub refuses files over 100 MB unless the beta *Sync large files with Git LFS* is on (LFS limit: 2 GB). A large upload can run out of memory on a phone.
+- **Largest upload (MB)** — files above this size are skipped on push. The default is 30. Files over 100 MB go through Git LFS (limit: 2 GB). A large upload can run out of memory on a phone.
 - **Automatic sync interval (minutes)** — 0 is off; otherwise 3 to 60.
 - **Pull when Obsidian starts** — on by default. The startup pull never pushes; local edits and deletions wait for a manual or interval sync.
 - **Deletion guard threshold** — 10 by default. A pull that would delete more files than this on the device, or a push that would delete more than this on GitHub, stops and asks first. Automatic and startup syncs pause instead until you run **Sync now**. 0 turns the guard off.
@@ -65,15 +66,9 @@ What it writes: the chosen file goes to Git LFS in your repository and stays the
 
 The results show in a window and go to the sync log. If a step fails, run **Export sync log** and share the note.
 
-### Sync large files with Git LFS
-
-Changes how sync works; it has no command. Files over 100 MB, up to 2 GB, go to GitHub through Git LFS. Only files within **Largest upload (MB)** are pushed, so raise that setting above 100 to use this. An LFS file that you edit stays in LFS at any size. LFS files from GitHub arrive as placeholders and download when you open them. A notice shows the progress of each LFS upload and download.
-
-What it writes: the files go to Git LFS storage in your repository. They count toward your LFS quota (10 GiB storage and 10 GiB download per month included on Free and Pro). The sync commit adds one line per file to `.gitattributes`; the plugin never removes lines. Desktop git needs [git-lfs](https://git-lfs.com) installed to see these files. While beta features are on, sync also talks to `github.com` and GitHub's LFS storage, not only `api.github.com`.
-
 ## Limits
 
-- Files over the upload limit (30 MB by default) are skipped with a warning; push them with desktop git. Without beta features, GitHub refuses files over 100 MB at any setting. With the beta *Sync large files with Git LFS*, files up to 2 GB go through Git LFS; desktop git then needs git-lfs installed.
+- Files over the upload limit (30 MB by default) are skipped with a warning. Files over 100 MB go through Git LFS, up to GitHub's 2 GB LFS limit; desktop git then needs git-lfs installed.
 - Syncing the config folder includes the code and settings of your other plugins. Anyone with write access to your repository can change what those plugins run. Use a repository only you control.
 - A conflict whose GitHub version is larger than the download limit is logged, but no copy lands in `_conflicts/`; resolve it with desktop git.
 - A new empty file is not uploaded until it has content.
