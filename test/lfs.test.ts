@@ -10,6 +10,7 @@ import {
 	httpUploader,
 	lfsPointer,
 	lfsTestSummary,
+	parseLfsPointer,
 	runLfsTest,
 	sha256Hex,
 } from "../src/lfs";
@@ -41,6 +42,39 @@ describe("lfsPointer", () => {
 		expect(lfsPointer(oid, 123)).toBe(
 			`version https://git-lfs.github.com/spec/v1\noid sha256:${oid}\nsize 123\n`,
 		);
+	});
+});
+
+describe("parseLfsPointer", () => {
+	const enc = (t: string) => new TextEncoder().encode(t).buffer as ArrayBuffer;
+	const oid = "0123456789abcdef".repeat(4);
+
+	it("reads oid and size from a v1 pointer", () => {
+		expect(parseLfsPointer(enc(lfsPointer(oid, 120087058)))).toEqual({ oid, size: 120087058 });
+	});
+
+	it("accepts extra keys between version and oid, as the spec allows", () => {
+		const text = `version https://git-lfs.github.com/spec/v1\next-0-foo sha256:${"1".repeat(64)}\noid sha256:${oid}\nsize 5\n`;
+		expect(parseLfsPointer(enc(text))).toEqual({ oid, size: 5 });
+	});
+
+	it("rejects anything that is not a v1 pointer", () => {
+		const cases = [
+			"hello world",
+			`version https://git-lfs.github.com/spec/v1\noid sha256:${oid}\n`, // no size
+			`version https://git-lfs.github.com/spec/v1\nsize 5\n`, // no oid
+			`version https://git-lfs.github.com/spec/v1\noid sha256:${oid.toUpperCase()}\nsize 5\n`, // uppercase hex
+			`version https://git-lfs.github.com/spec/v1\noid sha256:${oid}\nsize -1\n`,
+			`version https://git-lfs.github.com/spec/v1\r\noid sha256:${oid}\r\nsize 5\r\n`, // CRLF
+			`version https://example.com/v2\noid sha256:${oid}\nsize 5\n`,
+		];
+		for (const c of cases) expect(parseLfsPointer(enc(c)), c).toBeNull();
+	});
+
+	it("rejects data of 1024 bytes or more without decoding it", () => {
+		const big = new Uint8Array(1024);
+		big.set(new TextEncoder().encode(lfsPointer(oid, 5)));
+		expect(parseLfsPointer(big.buffer as ArrayBuffer)).toBeNull();
 	});
 });
 

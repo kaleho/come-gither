@@ -234,3 +234,16 @@ export function lfsTestSummary(results: LfsStepResult[]): { passed: number; tota
 		lines: results.map((r) => `${r.ok ? "✓" : "✗"} ${r.step} — ${r.detail}`),
 	};
 }
+
+const POINTER_MAX_BYTES = 1024;
+
+/** oid and size of a v1 LFS pointer (spec: under 1024 bytes, LF endings), else null. */
+export function parseLfsPointer(data: ArrayBuffer): { oid: string; size: number } | null {
+	if (data.byteLength >= POINTER_MAX_BYTES) return null;
+	const text = new TextDecoder().decode(data);
+	if (!text.startsWith("version https://git-lfs.github.com/spec/v1\n") || !text.endsWith("\n")) return null;
+	const oid = /^oid sha256:([0-9a-f]{64})$/m.exec(text);
+	const size = /^size (\d+)$/m.exec(text);
+	if (!oid || !size || text.includes("\r")) return null;
+	return { oid: oid[1], size: Number(size[1]) };
+}
