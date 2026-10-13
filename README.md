@@ -19,7 +19,9 @@ Real git implementations struggle on mobile with large repositories. Come Gither
 
 ## Network use disclosure
 
-This plugin sends the contents of your vault to the GitHub API (`api.github.com`) and downloads repository content from it. It talks to no other service. It collects no telemetry.
+This plugin sends the contents of your vault to the GitHub API (`api.github.com`) and downloads repository content from it. It collects no telemetry.
+
+The beta command *Test large file support* also contacts GitHub's Git LFS endpoint (`github.com`, `lfs.github.com`) and the storage URLs GitHub returns for the upload and download (currently Amazon S3 hosts run by GitHub). It runs only when beta features are on and you start the command. No other command talks to any other service.
 
 ## Token storage disclosure
 
