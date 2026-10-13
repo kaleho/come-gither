@@ -42,7 +42,11 @@ Spike must settle: (1) 114 MB single PUT to S3 on the iPad — via requestUrl, a
 
 iPad spike result (0.6.0 beta "Test large file support", 2026-10-13, user report): ALL 7 STEPS PASSED with the 114 MB file — hash, batch upload, upload, verify, pointer commit, download check (1 MiB range match), cleanup.
 - Settled: a ~114 MB single PUT to LFS storage works on the iPad; the configured token can use the LFS batch API; on-device SHA-256 of 114 MB works; the object is stored and downloadable by range.
-- Still open: which uploader succeeded (fetch or requestUrl); hash time; whether GitHub's web UI / raw endpoint treats the REST-committed pointer as LFS (the test checks the object, not the pointer's recognition — branch deleted after).
+- Log details (vault note come-gither-log-2026-10-13.md): file 2-sources/literature/books-and-booklets/FATHER_EN_E01.pdf, 120,087,058 bytes (114.5 MiB).
+  - hash: 52 ms on the iPad.
+  - upload: `fetch: Load failed` (storage refuses CORS for the app origin, as expected) → `requestUrl: 200` in about 7.6 s. The forum's "100 MB requestUrl crashes mobile" did NOT reproduce on this iPad at 114.5 MiB. Real sync can use requestUrl; fetch is not usable for storage PUTs.
+  - verify 200; download batch + Range 206, first 1 MiB matched.
+- Pointer commit 7928521 (unreachable now): pointer text and `.gitattributes` line are as specified; the contents API reports size=120087058 (the LFS size, not the 131-byte pointer). Recognition by the web UI / media host is still UNCONFIRMED: github.com/raw (token) and media.githubusercontent.com (token) both 404 for the unreachable private commit — inconclusive. Check it on the first real LFS commit on a live branch.
 
 ## Decisions (in flight)
 
