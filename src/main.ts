@@ -1,6 +1,7 @@
 import {
 	App,
 	ItemView,
+	Menu,
 	Modal,
 	Notice,
 	Plugin,
@@ -11,6 +12,7 @@ import {
 	normalizePath,
 	requestUrl,
 } from "obsidian";
+import { BETA_FEATURES, NO_BETA_FEATURES, betaFeatureText, ribbonMenuItems } from "./beta";
 import { GitHubClient } from "./github";
 import { RingLogger } from "./log";
 import type { SettingDefinitionItem } from "obsidian";
@@ -42,6 +44,7 @@ interface ComeGitherSettings {
 	autoSyncMinutes: number; // 0 = off; otherwise clamped to 3..60
 	pullOnStart: boolean;
 	deletionGuardThreshold: number; // 0 = off; a pull or push deleting more files asks first
+	betaFeatures: boolean; // shows the commands listed in src/beta.ts
 }
 
 const DEFAULT_SETTINGS: ComeGitherSettings = {
@@ -56,6 +59,7 @@ const DEFAULT_SETTINGS: ComeGitherSettings = {
 	autoSyncMinutes: 0,
 	pullOnStart: true,
 	deletionGuardThreshold: 10,
+	betaFeatures: false,
 };
 
 class ObsidianHttp implements Http {
@@ -205,6 +209,38 @@ class ConfirmDeletionsModal extends Modal {
 	}
 }
 
+class BetaFeaturesModal extends Modal {
+	constructor(
+		app: App,
+		private enabled: boolean,
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		this.titleEl.setText("Come Gither beta features");
+		this.contentEl.createEl("p", {
+			text: this.enabled
+				? "Beta features are on."
+				: "Beta features are off. Turn them on in the Come Gither settings.",
+		});
+		if (BETA_FEATURES.length === 0) {
+			this.contentEl.createEl("p", { text: NO_BETA_FEATURES });
+			return;
+		}
+		const list = this.contentEl.createEl("ul");
+		for (const f of BETA_FEATURES) {
+			const item = list.createEl("li");
+			item.createEl("strong", { text: f.name });
+			item.appendText(` — ${betaFeatureText(f)}`);
+		}
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
+}
+
 const PREVIEW_VIEW = "come-gither-preview";
 
 const INCOMING_LABELS: Record<string, string> = {
@@ -345,6 +381,14 @@ export default class ComeGitherPlugin extends Plugin {
 	// Paths with an open download prompt or a download in flight; file-open
 	// events for them are ignored so modals never stack.
 	private busyPaths = new Set<string>();
+	// The ribbon menu runs commands through this map, not the private
+	// app.commands API. A new beta command adds its id here too.
+	private readonly commandActions: Record<string, () => void> = {
+		"sync-now": () => void this.runSync(),
+		"preview-sync": () => void this.openPreview(),
+		"export-log": () => void this.exportLog(),
+		"show-beta-features": () => new BetaFeaturesModal(this.app, this.settings.betaFeatures).open(),
+	};
 
 	// Never hardcode ".obsidian": users can override the vault's config folder,
 	// and with a custom folder a hardcoded path would leave the plugin's own
@@ -379,6 +423,11 @@ export default class ComeGitherPlugin extends Plugin {
 			callback: () => void this.openPreview(),
 		});
 		this.addCommand({
+			id: "show-beta-features",
+			name: "Show beta features",
+			callback: () => this.commandActions["show-beta-features"](),
+		});
+		this.addCommand({
 			id: "evict-file",
 			name: "Remove local copy (keep on GitHub)",
 			checkCallback: (checking) => {
@@ -387,6 +436,14 @@ export default class ComeGitherPlugin extends Plugin {
 				if (!checking) void this.evictFile(file);
 				return true;
 			},
+		});
+
+		this.addRibbonIcon("git-branch", "Come Gither", (evt) => {
+			const menu = new Menu();
+			for (const item of ribbonMenuItems(this.settings.betaFeatures, BETA_FEATURES)) {
+				menu.addItem((m) => m.setTitle(item.title).onClick(() => this.commandActions[item.commandId]()));
+			}
+			menu.showAtMouseEvent(evt);
 		});
 
 		this.registerEvent(
@@ -753,6 +810,9 @@ export default class ComeGitherPlugin extends Plugin {
 	}
 }
 
+const BETA_DESC =
+	"Turns on unfinished features listed below. They may change or break; read what each one does before you turn this on.";
+
 class ComeGitherSettingTab extends PluginSettingTab {
 	constructor(
 		app: App,
@@ -804,6 +864,11 @@ class ComeGitherSettingTab extends PluginSettingTab {
 				desc: "A pull or push that would delete more files than this asks first; automatic and startup syncs pause instead until you run Sync now. 0 turns the guard off.",
 				control: { type: "number", key: "deletionGuardThreshold", min: 0, defaultValue: DEFAULT_SETTINGS.deletionGuardThreshold },
 			},
+			{ name: "Enable beta features", desc: BETA_DESC, control: { type: "toggle", key: "betaFeatures" } },
+			// The manifest, one plain row per feature, under the toggle.
+			...(BETA_FEATURES.length === 0
+				? [{ name: NO_BETA_FEATURES }]
+				: BETA_FEATURES.map((f) => ({ name: f.name, desc: betaFeatureText(f) }))),
 		];
 	}
 
@@ -922,5 +987,11 @@ class ComeGitherSettingTab extends PluginSettingTab {
 					}
 				}),
 			);
+		new Setting(containerEl)
+			.setName("Enable beta features")
+			.setDesc(BETA_DESC)
+			.addToggle((t) => t.setValue(s.betaFeatures).onChange((v) => ((s.betaFeatures = v), save())));
+		if (BETA_FEATURES.length === 0) new Setting(containerEl).setDesc(NO_BETA_FEATURES);
+		for (const f of BETA_FEATURES) new Setting(containerEl).setName(f.name).setDesc(betaFeatureText(f));
 	}
 }
