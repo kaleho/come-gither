@@ -11,7 +11,17 @@ export interface BetaFeature {
 	commandId?: string; // shown in the ribbon menu while beta is on
 }
 
-export const BETA_FEATURES: BetaFeature[] = [];
+export const BETA_FEATURES: BetaFeature[] = [
+	{
+		id: "lfs-test",
+		name: "Test large file support",
+		commandId: "lfs-test",
+		description:
+			"You pick a vault file. It checks whether this device and your token can send the file to GitHub's large file storage (Git LFS), the route for files over GitHub's 100 MB limit, and reports each step.",
+		writes:
+			"Uploads the chosen file to Git LFS in your repository. The file stays there and counts toward your LFS storage (10 GiB included on Free and Pro). Commits a pointer on a temporary branch, come-gither-lfs-test, and deletes the branch afterwards. Your sync branch is not changed.",
+	},
+];
 
 export const NO_BETA_FEATURES = "No beta features in this version.";
 

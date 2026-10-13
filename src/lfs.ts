@@ -225,3 +225,12 @@ export async function runLfsTest(deps: LfsTestDeps, path: string, data: ArrayBuf
 
 	return results;
 }
+
+/** One "✓/✗ step — detail" line per step, for the results modal, the log, and the Notice. */
+export function lfsTestSummary(results: LfsStepResult[]): { passed: number; total: number; lines: string[] } {
+	return {
+		passed: results.filter((r) => r.ok).length,
+		total: results.length,
+		lines: results.map((r) => `${r.ok ? "✓" : "✗"} ${r.step} — ${r.detail}`),
+	};
+}

@@ -55,6 +55,14 @@ Beta features are unfinished. Each one lists what it does and what it writes. Re
 
 While beta features are off, their commands do not show in the command palette or the ribbon menu.
 
+### Test large file support
+
+Checks whether this device and your token can send a file to GitHub's large file storage (Git LFS). Git LFS is the route for files over GitHub's 100 MB limit. You pick a vault file (largest first) and confirm. The command hashes the file, asks GitHub for an upload, uploads the file, verifies it, commits a pointer, and reads the start of the file back. It reports each step.
+
+What it writes: the chosen file goes to Git LFS in your repository and stays there. It counts toward your LFS storage (10 GiB included on Free and Pro). A pointer commit goes on a temporary branch, `come-gither-lfs-test`, and the command deletes the branch afterwards. Your sync branch does not change. This command also talks to `github.com` and GitHub's LFS storage, not only `api.github.com`.
+
+The results show in a window and go to the sync log. If a step fails, run **Export sync log** and share the note.
+
 ## Limits
 
 - Files over the upload limit (30 MB by default) are skipped with a warning; push them with desktop git. GitHub refuses files over 100 MB at any setting.

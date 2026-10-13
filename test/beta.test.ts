@@ -19,8 +19,13 @@ const withCommand: BetaFeature = {
 const withoutCommand: BetaFeature = { id: "b", name: "Feature B", description: "Does B.", writes: "Nothing." };
 
 describe("BETA_FEATURES", () => {
-	it("starts empty", () => {
-		expect(BETA_FEATURES).toEqual([]);
+	it("lists the LFS test command, shown in the ribbon menu only while beta is on", () => {
+		const f = BETA_FEATURES.find((x) => x.id === "lfs-test");
+		expect(f).toMatchObject({ name: "Test large file support", commandId: "lfs-test" });
+		expect(f?.description).toMatch(/Git LFS/);
+		expect(f?.writes).toMatch(/come-gither-lfs-test/);
+		expect(ribbonMenuItems(true, BETA_FEATURES)).toContainEqual({ title: "Test large file support", commandId: "lfs-test" });
+		expect(ribbonMenuItems(false, BETA_FEATURES)).toEqual(CORE);
 	});
 });
 

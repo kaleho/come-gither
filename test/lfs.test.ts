@@ -9,6 +9,7 @@ import {
 	gitattributesLine,
 	httpUploader,
 	lfsPointer,
+	lfsTestSummary,
 	runLfsTest,
 	sha256Hex,
 } from "../src/lfs";
@@ -397,5 +398,24 @@ describe("runLfsTest", () => {
 		const results = await runLfsTest(deps, "big.bin", "not a buffer" as unknown as ArrayBuffer);
 		expect(results[0].ok).toBe(false);
 		for (const r of results.slice(1)) expect(r.detail).toMatch(/^skipped: /);
+	});
+});
+
+describe("lfsTestSummary", () => {
+	it("counts passed steps and marks each line", () => {
+		expect(
+			lfsTestSummary([
+				{ step: "hash", ok: true, detail: "oid 1a2b…, 812 ms" },
+				{ step: "upload", ok: false, detail: "fetch: TypeError: Failed to fetch; requestUrl: 500" },
+			]),
+		).toEqual({
+			passed: 1,
+			total: 2,
+			lines: ["✓ hash — oid 1a2b…, 812 ms", "✗ upload — fetch: TypeError: Failed to fetch; requestUrl: 500"],
+		});
+	});
+
+	it("handles no steps", () => {
+		expect(lfsTestSummary([])).toEqual({ passed: 0, total: 0, lines: [] });
 	});
 });

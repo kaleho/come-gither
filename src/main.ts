@@ -1,5 +1,6 @@
 import {
 	App,
+	FuzzySuggestModal,
 	ItemView,
 	Menu,
 	Modal,
@@ -14,6 +15,7 @@ import {
 } from "obsidian";
 import { BETA_FEATURES, NO_BETA_FEATURES, betaFeatureText, ribbonMenuItems } from "./beta";
 import { GitHubClient } from "./github";
+import { LfsClient, httpUploader, lfsTestSummary, runLfsTest } from "./lfs";
 import { RingLogger } from "./log";
 import type { SettingDefinitionItem } from "obsidian";
 import type { Files, Http, HttpRequest, HttpResponse } from "./ports";
@@ -25,6 +27,7 @@ import {
 	clampSyncMinutes,
 	confirmOrDefer,
 	formatSize,
+	largestFirst,
 	lowercaseHeaders,
 	maxDeletionsFor,
 	parentDirs,
@@ -63,15 +66,20 @@ const DEFAULT_SETTINGS: ComeGitherSettings = {
 };
 
 class ObsidianHttp implements Http {
+	// LFS traffic passes bustCache: false. Its download href is a presigned
+	// storage URL, and an added query parameter breaks the signature (403).
+	constructor(private opts: { bustCache: boolean } = { bustCache: true }) {}
+
 	async request(req: HttpRequest): Promise<HttpResponse> {
 		const method = req.method ?? "GET";
+		const bust = this.opts.bustCache;
 		// The iOS URL cache honors GitHub's max-age=60 and serves stale refs
 		// for up to a minute after a push, which breaks fast-forward updates.
 		// Bust the cache per request and ask the cache layer to revalidate.
 		const res = await requestUrl({
-			url: cacheBustedUrl(req.url, method),
+			url: bust ? cacheBustedUrl(req.url, method) : req.url,
 			method,
-			headers: { "Cache-Control": "no-cache", ...req.headers },
+			headers: bust ? { "Cache-Control": "no-cache", ...req.headers } : req.headers,
 			body: req.body,
 			throw: false,
 		});
@@ -241,6 +249,89 @@ class BetaFeaturesModal extends Modal {
 	}
 }
 
+type SizedFile = { file: TFile; size: number };
+
+class LfsFilePickModal extends FuzzySuggestModal<SizedFile> {
+	constructor(
+		app: App,
+		private onPick: (item: SizedFile) => void,
+	) {
+		super(app);
+		this.setPlaceholder("Pick a file to test large file support with");
+	}
+
+	getItems(): SizedFile[] {
+		return largestFirst(this.app.vault.getFiles().map((file) => ({ file, size: file.stat.size })));
+	}
+
+	getItemText(item: SizedFile): string {
+		return `${item.file.path} (${formatSize(item.size)})`;
+	}
+
+	onChooseItem(item: SizedFile): void {
+		this.onPick(item);
+	}
+}
+
+class LfsTestConfirmModal extends Modal {
+	constructor(
+		app: App,
+		private item: SizedFile,
+		private repo: string,
+		private onRun: () => void,
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		this.titleEl.setText("Test large file support");
+		this.contentEl.createEl("p", {
+			text: `This uploads ${this.item.file.path} (${formatSize(this.item.size)}) to Git LFS storage in ${this.repo}.`,
+		});
+		this.contentEl.createEl("p", {
+			text: "The file stays in LFS storage and counts toward your LFS quota. A pointer is committed on the temporary branch come-gither-lfs-test, and the branch is deleted afterwards. Your sync branch is not changed.",
+		});
+		// Escape, a tap outside, or Cancel runs nothing: the safe answer.
+		new Setting(this.contentEl)
+			.addButton((b) =>
+				b.setButtonText("Run").onClick(() => {
+					this.close();
+					this.onRun();
+				}),
+			)
+			.addButton((b) => b.setButtonText("Cancel").setCta().onClick(() => this.close()));
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
+}
+
+class LfsTestResultsModal extends Modal {
+	constructor(
+		app: App,
+		private summary: { passed: number; total: number; lines: string[] },
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		const { passed, total, lines } = this.summary;
+		this.titleEl.setText(`LFS test: ${passed} of ${total} steps passed`);
+		const list = this.contentEl.createEl("ul");
+		for (const line of lines) list.createEl("li", { text: line });
+		if (passed < total) {
+			this.contentEl.createEl("p", {
+				text: "A step failed. Run Export sync log and share the note it creates.",
+			});
+		}
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
+}
+
 const PREVIEW_VIEW = "come-gither-preview";
 
 const INCOMING_LABELS: Record<string, string> = {
@@ -381,6 +472,7 @@ export default class ComeGitherPlugin extends Plugin {
 	// Paths with an open download prompt or a download in flight; file-open
 	// events for them are ignored so modals never stack.
 	private busyPaths = new Set<string>();
+	private lfsTesting = false;
 	// The ribbon menu runs commands through this map, not the private
 	// app.commands API. A new beta command adds its id here too.
 	private readonly commandActions: Record<string, () => void> = {
@@ -388,6 +480,7 @@ export default class ComeGitherPlugin extends Plugin {
 		"preview-sync": () => void this.openPreview(),
 		"export-log": () => void this.exportLog(),
 		"show-beta-features": () => new BetaFeaturesModal(this.app, this.settings.betaFeatures).open(),
+		"lfs-test": () => this.startLfsTest(),
 	};
 
 	// Never hardcode ".obsidian": users can override the vault's config folder,
@@ -426,6 +519,15 @@ export default class ComeGitherPlugin extends Plugin {
 			id: "show-beta-features",
 			name: "Show beta features",
 			callback: () => this.commandActions["show-beta-features"](),
+		});
+		this.addCommand({
+			id: "lfs-test",
+			name: "Test large file support",
+			checkCallback: (checking) => {
+				if (!this.settings.betaFeatures) return false;
+				if (!checking) this.commandActions["lfs-test"]();
+				return true;
+			},
 		});
 		this.addCommand({
 			id: "evict-file",
@@ -526,14 +628,18 @@ export default class ComeGitherPlugin extends Plugin {
 		return (await this.getSession()).engine;
 	}
 
-	private async buildSession(): Promise<{ engine: SyncEngine; state: StateStore }> {
-		const client = new GitHubClient(new ObsidianHttp(), {
+	private gitHubClient(): GitHubClient {
+		return new GitHubClient(new ObsidianHttp(), {
 			owner: this.settings.owner,
 			repo: this.settings.repo,
 			token: this.settings.token,
 			sleep: (ms) => new Promise((resolve) => window.setTimeout(resolve, ms)),
 			log: this.logger.log,
 		});
+	}
+
+	private async buildSession(): Promise<{ engine: SyncEngine; state: StateStore }> {
+		const client = this.gitHubClient();
 		const state = new StateStore(this.vaultFiles, `${this.pluginDir}/sync-state.json`);
 		await state.load(`${this.settings.owner}/${this.settings.repo}#${this.settings.branch}`);
 		if (state.rebaselined) {
@@ -794,6 +900,75 @@ export default class ComeGitherPlugin extends Plugin {
 			new Notice(`Come Gither: could not remove the local copy — ${message}`);
 		} finally {
 			await this.logger.flush();
+		}
+	}
+
+	private startLfsTest(): void {
+		if (!this.configured()) {
+			new Notice("Come Gither: fill in the repository settings first.");
+			return;
+		}
+		const repo = `${this.settings.owner}/${this.settings.repo}`;
+		new LfsFilePickModal(this.app, (item) =>
+			new LfsTestConfirmModal(this.app, item, repo, () => void this.runLfsTestCommand(item.file.path)).open(),
+		).open();
+	}
+
+	private async runLfsTestCommand(path: string): Promise<void> {
+		if (this.lfsTesting) {
+			new Notice("Come Gither: the LFS test is already running.");
+			return;
+		}
+		if (this.syncing) {
+			new Notice("Come Gither: a sync is running. Run the LFS test after it finishes.");
+			return;
+		}
+		this.lfsTesting = true;
+		const checkpoint = async (message: string) => {
+			this.logger.log("info", message);
+			await this.logger.flush();
+		};
+		try {
+			new Notice("Come Gither: LFS test running…");
+			await checkpoint(`LFS test started: ${path}`);
+			const data = await this.vaultFiles.readBinary(path);
+			// No cache-buster on LFS traffic: it breaks presigned storage URLs.
+			const rawHttp = new ObsidianHttp({ bustCache: false });
+			const { owner, repo, token } = this.settings;
+			const results = await runLfsTest(
+				{
+					lfs: new LfsClient(rawHttp, { owner, repo, token }),
+					gh: this.gitHubClient(),
+					baseBranch: this.settings.branch,
+					// fetch first: a forum report says a ~100 MB requestUrl body can
+					// crash mobile Obsidian, while fetch does not. fetch works only if
+					// storage answers CORS for the app origin; a refusal throws, and
+					// runLfsTest records it and tries requestUrl.
+					uploaders: [
+						{
+							name: "fetch",
+							put: async (a, body) => (await fetch(a.href, { method: "PUT", headers: a.header, body })).status,
+						},
+						{ name: "requestUrl", put: httpUploader(rawHttp) },
+					],
+					checkpoint,
+					now: () => Date.now(),
+				},
+				path,
+				data,
+			);
+			const summary = lfsTestSummary(results);
+			results.forEach((r, i) => this.logger.log(r.ok ? "info" : "warn", `LFS test ${summary.lines[i]}`));
+			await this.logger.flush();
+			new LfsTestResultsModal(this.app, summary).open();
+			new Notice(`Come Gither: LFS test finished — ${summary.passed} of ${summary.total} steps passed.`);
+		} catch (e) {
+			const message = e instanceof Error ? e.message : String(e);
+			this.logger.log("error", `LFS test failed: ${message}`);
+			new Notice(`Come Gither: LFS test failed — ${message}`);
+		} finally {
+			await this.logger.flush();
+			this.lfsTesting = false;
 		}
 	}
 
