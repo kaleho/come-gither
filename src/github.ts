@@ -129,6 +129,14 @@ export class GitHubClient {
 		await this.call("PATCH", `/git/refs/heads/${branch}`, { sha, force: false });
 	}
 
+	async createRef(branch: string, sha: string): Promise<void> {
+		await this.call("POST", "/git/refs", { ref: `refs/heads/${branch}`, sha });
+	}
+
+	async deleteRef(branch: string): Promise<void> {
+		await this.call("DELETE", `/git/refs/heads/${branch}`);
+	}
+
 	private logOpt(level: "info" | "warn" | "error", message: string): void {
 		this.opts.log?.(level, message);
 	}

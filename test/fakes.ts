@@ -315,6 +315,22 @@ export class FakeGitHub {
 		this.filesByPath = new Map(this.snapshots.get(commit.treeSha) as Map<string, RemoteFile>);
 	}
 
+	/** Branch refs other than the sync head (the LFS test branch). */
+	refs = new Map<string, string>();
+	failCreateRef: GitHubError | null = null;
+	failDeleteRef: GitHubError | null = null;
+
+	async createRef(branch: string, sha: string): Promise<void> {
+		if (this.failCreateRef) throw this.failCreateRef;
+		if (this.refs.has(branch)) throw new GitHubError(422, "other", "fake: Reference already exists");
+		this.refs.set(branch, sha);
+	}
+
+	async deleteRef(branch: string): Promise<void> {
+		if (this.failDeleteRef) throw this.failDeleteRef;
+		if (!this.refs.delete(branch)) throw new GitHubError(422, "other", "fake: Reference does not exist");
+	}
+
 	async getBlobRaw(sha: string): Promise<ArrayBuffer> {
 		const index = this.blobFetchCount++;
 		if (this.failBlobFetchAtIndex === index) {

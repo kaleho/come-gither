@@ -109,6 +109,31 @@ describe("GitHubClient writes", () => {
 		expect(body).toEqual({ sha: "c2", force: false });
 	});
 
+	it("createRef posts a full heads ref with the sha", async () => {
+		const http = new FakeHttp();
+		http.on("POST", "/repos/kaleho/vault/git/refs", jsonResponse({ ref: "refs/heads/x" }, 201));
+		await makeClient(http).createRef("x", "c2");
+		expect(http.requests[0].url).toBe("https://api.github.com/repos/kaleho/vault/git/refs");
+		expect(http.bodyOf(0)).toEqual({ ref: "refs/heads/x", sha: "c2" });
+	});
+
+	it("deleteRef deletes the branch ref and accepts an empty 204", async () => {
+		const http = new FakeHttp();
+		http.on("DELETE", "/git/refs/heads/x", { status: 204, text: "" });
+		await makeClient(http).deleteRef("x");
+		expect(http.requests[0].method).toBe("DELETE");
+		expect(http.requests[0].url).toBe("https://api.github.com/repos/kaleho/vault/git/refs/heads/x");
+		expect(http.requests[0].body).toBeUndefined();
+	});
+
+	it("createRef surfaces 422 (ref exists) as a GitHubError", async () => {
+		const http = new FakeHttp();
+		http.on("POST", "/git/refs", jsonResponse({ message: "Reference already exists" }, 422));
+		const err = await makeClient(http).createRef("x", "c2").catch((e) => e);
+		expect(err).toBeInstanceOf(GitHubError);
+		expect(err.status).toBe(422);
+	});
+
 	it("caps the write throttle when the clock steps backwards", async () => {
 		const http = new FakeHttp();
 		http.on("POST", "/git/blobs", jsonResponse({ sha: "b" }, 201));
