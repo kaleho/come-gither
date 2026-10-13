@@ -1,12 +1,16 @@
 ---
 id: FEAT-0011-09790A83
-status: proposed
+status: done
 created: '2026-10-13T20:29:21+00:00'
-updated: '2026-10-13T20:29:21+00:00'
+updated: '2026-10-13T20:32:44+00:00'
 advances: []
 verifies: []
-derived_from: [SES-0001]
-related: [FEAT-0009, FEAT-0010, DEC-0002]
+derived_from:
+- SES-0001
+related:
+- FEAT-0009
+- FEAT-0010
+- DEC-0002
 branches:
 - feat/lfs-out-of-beta
 external: {}
