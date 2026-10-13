@@ -29,6 +29,22 @@ describe("BETA_FEATURES", () => {
 	});
 });
 
+describe("BETA_FEATURES: LFS sync", () => {
+	it("lists LFS sync as a behavior change, never a ribbon command", () => {
+		const f = BETA_FEATURES.find((x) => x.id === "lfs-sync");
+		expect(f).toMatchObject({ name: "Sync large files with Git LFS" });
+		expect(f?.commandId).toBeUndefined();
+		expect(f?.description).toMatch(/100 MB/);
+		expect(f?.description).toMatch(/2 GB/);
+		expect(f?.description).toMatch(/Largest upload \(MB\)/);
+		expect(f?.description).toMatch(/placeholders/);
+		expect(f?.writes).toMatch(/quota/);
+		expect(f?.writes).toMatch(/\.gitattributes/);
+		expect(f?.writes).toMatch(/git-lfs/);
+		expect(ribbonMenuItems(true, BETA_FEATURES).map((i) => i.title)).not.toContain("Sync large files with Git LFS");
+	});
+});
+
 describe("ribbonMenuItems", () => {
 	it("lists the core commands in order with an empty manifest", () => {
 		expect(ribbonMenuItems(true, [])).toEqual(CORE);

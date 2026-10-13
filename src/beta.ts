@@ -21,6 +21,15 @@ export const BETA_FEATURES: BetaFeature[] = [
 		writes:
 			"Uploads the chosen file to Git LFS in your repository. The file stays there and counts toward your LFS storage (10 GiB included on Free and Pro). Commits a pointer on a temporary branch, come-gither-lfs-test, and deletes the branch afterwards. Your sync branch is not changed.",
 	},
+	{
+		// No command: it changes how sync behaves.
+		id: "lfs-sync",
+		name: "Sync large files with Git LFS",
+		description:
+			'Files over 100 MB (up to 2 GB, and within your "Largest upload (MB)" setting — raise it above 100 to use this) are pushed through Git LFS. LFS files from GitHub arrive as placeholders and download when you open them.',
+		writes:
+			"Uploads those files to Git LFS storage in your repository. They count toward your LFS quota (10 GiB storage and 10 GiB download per month included on Free and Pro). Adds one line per file to .gitattributes and never removes lines. Desktop git needs git-lfs installed to see these files.",
+	},
 ];
 
 export const NO_BETA_FEATURES = "No beta features in this version.";

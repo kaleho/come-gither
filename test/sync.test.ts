@@ -2327,6 +2327,43 @@ describe("LFS (beta)", () => {
 		});
 	});
 
+	describe("progress plumbing", () => {
+		it("passes each LFS upload its path, 1-based index, and the push's LFS candidate count", async () => {
+			const { gh, files, lfs, engine } = lfsEngine({ maxLfsBytes: 1000, maxPushBytes: 1000 });
+			await gh.setFiles({ "a.md": "one" });
+			await engine.pull();
+			await files.writeBinary("big.bin", buf(blob(20)));
+			await files.writeBinary("dir/c.bin", buf(blob(30)));
+			await files.writeBinary("small.md", text("not lfs"));
+			await engine.push();
+			expect(lfs.uploadInfos).toEqual([
+				{ path: "big.bin", index: 1, total: 2 },
+				{ path: "dir/c.bin", index: 2, total: 2 },
+			]);
+		});
+
+		it("counts a failed upload as an attempt", async () => {
+			const { gh, files, lfs, engine } = lfsEngine();
+			await gh.setFiles({ "a.md": "one" });
+			await engine.pull();
+			lfs.failUpload = true;
+			await files.writeBinary("big.bin", buf(blob(20)));
+			await engine.push();
+			expect(lfs.uploadInfos).toEqual([{ path: "big.bin", index: 1, total: 1 }]);
+		});
+
+		it("fetchLazy hands its progress callback to the LFS download", async () => {
+			const { gh, lfs, engine } = lfsEngine();
+			const real = blob(500, 9);
+			lfs.objects.set(await oidOf(real), real);
+			await gh.setFiles({ "v.mp4": await pointerOf(real) });
+			await engine.pull();
+			const seen: [number, number][] = [];
+			expect(await engine.fetchLazy("v.mp4", (d, t) => seen.push([d, t]))).toBe("fetched");
+			expect(seen).toEqual([[500, 500]]);
+		});
+	});
+
 	describe("pull", () => {
 		it("turns a pointer into a placeholder with the real size, for binary and text extensions", async () => {
 			const { gh, files, state, engine } = lfsEngine();

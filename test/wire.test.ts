@@ -9,7 +9,10 @@ import {
 	maxDeletionsFor,
 	parentDirs,
 	parseDeletionThreshold,
+	progressBar,
+	progressText,
 	syncParts,
+	uploadText,
 } from "../src/wire";
 import type { PullSummary, PushSummary } from "../src/sync";
 
@@ -155,5 +158,34 @@ describe("largestFirst", () => {
 		];
 		expect(largestFirst(items).map((i) => i.path)).toEqual(["b", "c", "a"]);
 		expect(items[0].path).toBe("a");
+	});
+});
+
+describe("progressBar", () => {
+	it("fills 10 cells in proportion, rounding down, clamped", () => {
+		expect(progressBar(0, 100)).toBe("░░░░░░░░░░");
+		expect(progressBar(42, 100)).toBe("▓▓▓▓░░░░░░");
+		expect(progressBar(100, 100)).toBe("▓▓▓▓▓▓▓▓▓▓");
+		expect(progressBar(150, 100)).toBe("▓▓▓▓▓▓▓▓▓▓");
+		expect(progressBar(0, 0)).toBe("▓▓▓▓▓▓▓▓▓▓");
+	});
+});
+
+describe("progressText", () => {
+	it("names the file, the bytes done and total, and a bar", () => {
+		const MB = 1048576;
+		expect(progressText("FATHER_EN_E01.pdf", 48 * MB, 114.5 * MB)).toBe(
+			"Downloading FATHER_EN_E01.pdf: 48.0 MB of 114.5 MB ▓▓▓▓░░░░░░",
+		);
+	});
+});
+
+describe("uploadText", () => {
+	const size = 114.5 * 1048576;
+	it("shows the name, size, and m:ss elapsed for a single upload", () => {
+		expect(uploadText("FATHER_EN_E01.pdf", size, 7999, 1, 1)).toBe("Uploading FATHER_EN_E01.pdf (114.5 MB)… 0:07");
+	});
+	it("adds n of N when the push has several LFS uploads", () => {
+		expect(uploadText("a.pdf", size, 125_000, 2, 3)).toBe("Uploading a.pdf (114.5 MB)… 2:05 — 2 of 3");
 	});
 });
