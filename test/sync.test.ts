@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import { DEFAULT_TEXT_EXTENSIONS, DeletionsDeferred, SyncEngine } from "../src/sync";
 import type { DeletionDecision } from "../src/sync";
 import { StateStore } from "../src/state";
-import { CaseFoldMemFiles, FakeGitHub, MemFiles, gitSha } from "./fakes";
+import { gitattributesLine, lfsPointer, sha256Hex } from "../src/lfs";
+import { CaseFoldMemFiles, FakeGitHub, FakeLfs, MemFiles, gitSha } from "./fakes";
 
 const STATE_PATH = ".obsidian/plugins/come-gither/sync-state.json";
 
@@ -16,6 +17,9 @@ function makeEngine(
 		files?: MemFiles;
 		maxDeletions?: number;
 		confirmDeletions?: (direction: "local" | "remote", paths: string[]) => Promise<DeletionDecision>;
+		lfs?: FakeLfs;
+		lfsThresholdBytes?: number;
+		maxLfsBytes?: number;
 	} = {},
 ) {
 	const gh = new FakeGitHub();
@@ -37,6 +41,9 @@ function makeEngine(
 		],
 		maxDeletions: overrides.maxDeletions ?? Infinity,
 		confirmDeletions: overrides.confirmDeletions,
+		...(overrides.lfs ? { lfs: overrides.lfs } : {}),
+		...(overrides.lfsThresholdBytes !== undefined ? { lfsThresholdBytes: overrides.lfsThresholdBytes } : {}),
+		...(overrides.maxLfsBytes !== undefined ? { maxLfsBytes: overrides.maxLfsBytes } : {}),
 	});
 	return { gh, files, state, engine, logs };
 }
@@ -2154,6 +2161,339 @@ describe("deletion guard", () => {
 			const { push } = await engine.sync();
 			expect(push.commit).not.toBeNull();
 			expect(gh.filesByPath.has("n/0.md")).toBe(true);
+		});
+	});
+});
+
+describe("LFS (beta)", () => {
+	const blob = (n: number, fill = 7) => new Uint8Array(n).fill(fill);
+	const buf = (b: Uint8Array) => b.slice().buffer as ArrayBuffer;
+	const oidOf = (b: Uint8Array) => sha256Hex(buf(b));
+	const pointerOf = async (b: Uint8Array) => lfsPointer(await oidOf(b), b.byteLength);
+	const ATTR = ".gitattributes";
+
+	function lfsEngine(extra: Parameters<typeof makeEngine>[0] = {}) {
+		const lfs = new FakeLfs();
+		return { lfs, ...makeEngine({ lfs, lfsThresholdBytes: 10, maxLfsBytes: 50, maxPushBytes: 100, ...extra }) };
+	}
+
+	/** The same vault and state with beta (LFS) turned off. */
+	function lfsOff(env: { gh: FakeGitHub; files: MemFiles; state: StateStore }) {
+		const logs: string[] = [];
+		const engine = new SyncEngine(env.gh, env.files, env.state, (l, m) => logs.push(`${l}: ${m}`), {
+			branch: "master",
+			textExtensions: DEFAULT_TEXT_EXTENSIONS,
+			maxAutoFetchBytes: 100 * 1048576,
+			maxPushBytes: 100,
+			conflictPolicy: "merge",
+			configDir: ".obsidian",
+			excludedPrefixes: ["_conflicts/", ".obsidian/plugins/come-gither/"],
+			maxDeletions: Infinity,
+		});
+		return { engine, logs };
+	}
+
+	/** A synced LFS file "big.bin" (20 bytes) pushed by this engine. */
+	async function pushedLfsFile(extra: Parameters<typeof makeEngine>[0] = {}) {
+		const env = lfsEngine(extra);
+		await env.gh.setFiles({ "a.md": "one" });
+		await env.engine.pull();
+		await env.files.writeBinary("big.bin", buf(blob(20)));
+		await env.engine.push();
+		return env;
+	}
+
+	describe("push", () => {
+		it("pushes a new file over the threshold as a pointer, with its .gitattributes line, in one commit", async () => {
+			const { gh, files, state, lfs } = await pushedLfsFile();
+			const oid = await oidOf(blob(20));
+			const pointerSha = await gitSha(await pointerOf(blob(20)));
+			expect(lfs.uploads).toEqual([oid]);
+			expect(gh.pushedTrees).toHaveLength(1);
+			const entries = gh.pushedTrees[0].entries;
+			expect(entries).toContainEqual({ path: "big.bin", mode: "100644", type: "blob", sha: pointerSha });
+			expect(files.readText(ATTR)).toBe(`${gitattributesLine("big.bin")}\n`);
+			expect(entries).toContainEqual({ path: ATTR, mode: "100644", type: "blob", sha: await gitSha(files.readText(ATTR)) });
+			expect(state.state.files["big.bin"]).toMatchObject({ baseBlobSha: pointerSha, size: 20, lfs: { oid, size: 20 } });
+			expect(state.state.files["big.bin"].lazy).toBeUndefined();
+		});
+
+		it("never re-uploads an unchanged LFS file, even after its mtime drifts", async () => {
+			const { files, lfs, engine } = await pushedLfsFile();
+			files.mtimes.set("big.bin", 999);
+			const summary = await engine.push();
+			expect(summary.commit).toBe(null);
+			expect(lfs.uploads).toHaveLength(1);
+		});
+
+		it("keeps an edited LFS file in LFS even under the threshold", async () => {
+			const { gh, files, state, lfs, engine } = await pushedLfsFile();
+			await files.writeBinary("big.bin", buf(blob(5, 1)));
+			const summary = await engine.push();
+			expect(summary.pushed).toBe(1);
+			const oid = await oidOf(blob(5, 1));
+			expect(lfs.uploads[1]).toBe(oid);
+			expect(gh.pushedTrees[1].entries).toEqual([
+				{ path: "big.bin", mode: "100644", type: "blob", sha: await gitSha(await pointerOf(blob(5, 1))) },
+			]);
+			expect(state.state.files["big.bin"].lfs).toEqual({ oid, size: 5 });
+		});
+
+		it("skips a file whose upload fails, commits no pointer, and still pushes the others", async () => {
+			const { gh, files, state, lfs, engine, logs } = lfsEngine();
+			await gh.setFiles({ "a.md": "one" });
+			await engine.pull();
+			lfs.failUpload = true;
+			await files.writeBinary("big.bin", buf(blob(20)));
+			await files.writeBinary("b.md", text("two"));
+			const summary = await engine.push();
+			expect(summary.skippedPaths).toEqual(["big.bin"]);
+			const paths = gh.pushedTrees[0].entries.map((e) => e.path);
+			expect(paths).toContain("b.md");
+			expect(paths).not.toContain("big.bin");
+			expect(state.state.files["big.bin"]).toBeUndefined();
+			expect(logs.some((l) => l.startsWith("warn:") && l.includes("big.bin") && l.includes("LFS upload failed"))).toBe(true);
+		});
+
+		it("skips a file over the LFS limit with a warning that names 2 GB", async () => {
+			const { gh, files, lfs, engine, logs } = lfsEngine();
+			await gh.setFiles({ "a.md": "one" });
+			await engine.pull();
+			await files.writeBinary("huge.bin", buf(blob(60)));
+			expect((await engine.preview()).outgoing).toEqual([{ path: "huge.bin", action: "skip-oversize", size: 60 }]);
+			const summary = await engine.push();
+			expect(summary.skippedPaths).toEqual(["huge.bin"]);
+			expect(lfs.uploads).toEqual([]);
+			expect(logs.some((l) => l.startsWith("warn:") && l.includes("huge.bin") && l.includes("2 GB"))).toBe(true);
+			expect(await files.stat(ATTR)).toBeNull();
+		});
+
+		it("with LFS off, a file over the push limit is skipped as before and no .gitattributes appears", async () => {
+			const { gh, files, engine, logs } = makeEngine({ maxPushBytes: 15 });
+			await gh.setFiles({ "a.md": "one" });
+			await engine.pull();
+			await files.writeBinary("big.bin", buf(blob(20)));
+			const summary = await engine.push();
+			expect(summary.skippedPaths).toEqual(["big.bin"]);
+			expect(logs).toContain("warn: big.bin is 20 bytes, over the push limit; push it from desktop git");
+			expect(await files.stat(ATTR)).toBeNull();
+		});
+
+		it("by default sends only files over 100 MiB through LFS", async () => {
+			const lfs = new FakeLfs();
+			const { gh, files, state, engine } = makeEngine({ lfs });
+			await gh.setFiles({ "a.md": "one" });
+			await engine.pull();
+			await files.writeBinary("big.bin", buf(blob(20)));
+			await engine.push();
+			expect(lfs.uploads).toEqual([]);
+			expect(state.state.files["big.bin"]).toMatchObject({ baseBlobSha: await gitSha(blob(20)) });
+			expect(state.state.files["big.bin"].lfs).toBeUndefined();
+			expect(await files.stat(ATTR)).toBeNull();
+		});
+
+		it("does not duplicate a .gitattributes line that is already there", async () => {
+			const { gh, files, engine } = lfsEngine();
+			const existing = `*.psd binary\n${gitattributesLine("big.bin")}\n`;
+			await gh.setFiles({ [ATTR]: existing });
+			await engine.pull();
+			await files.writeBinary("big.bin", buf(blob(20)));
+			await engine.push();
+			expect(files.readText(ATTR)).toBe(existing);
+			expect(gh.pushedTrees[0].entries.map((e) => e.path)).toEqual(["big.bin"]);
+		});
+
+		it("appends after a .gitattributes with no trailing newline, keeping its bytes", async () => {
+			const { gh, files, engine } = lfsEngine({ maxLfsBytes: 1000, maxPushBytes: 1000 });
+			await gh.setFiles({ [ATTR]: "*.psd binary" });
+			await engine.pull();
+			await files.writeBinary("big.bin", buf(blob(20)));
+			await files.writeBinary("dir/b c.bin", buf(blob(30)));
+			await engine.push();
+			expect(files.readText(ATTR)).toBe(
+				`*.psd binary\n${gitattributesLine("big.bin")}\n${gitattributesLine("dir/b c.bin")}\n`,
+			);
+			expect(gh.pushedTrees).toHaveLength(1);
+			expect(gh.pushedTrees[0].entries.map((e) => e.path).sort()).toEqual([ATTR, "big.bin", "dir/b c.bin"]);
+		});
+
+		it("refuses to push an edited LFS file while LFS is off", async () => {
+			const env = await pushedLfsFile();
+			const off = lfsOff(env);
+			await env.files.writeBinary("big.bin", buf(blob(25, 3)));
+			const summary = await off.engine.push();
+			expect(summary.skippedPaths).toEqual(["big.bin"]);
+			expect(off.logs.some((l) => l.includes("big.bin") && l.includes("beta"))).toBe(true);
+		});
+	});
+
+	describe("pull", () => {
+		it("turns a pointer into a placeholder with the real size, for binary and text extensions", async () => {
+			const { gh, files, state, engine } = lfsEngine();
+			const video = blob(500, 2);
+			const note = blob(300, 65);
+			await gh.setFiles({ "v.mp4": await pointerOf(video), "n.md": await pointerOf(note), "plain.md": "hi", "long.md": "x".repeat(2000) });
+			const summary = await engine.pull();
+			expect(summary).toMatchObject({ placeholders: 2, fetched: 2 });
+			// Too large to be a pointer: fetched once, for the write only.
+			expect(gh.blobFetches.filter((s) => s === state.state.files["long.md"].baseBlobSha)).toHaveLength(1);
+			expect((await files.stat("v.mp4"))?.size).toBe(0);
+			expect((await files.stat("n.md"))?.size).toBe(0);
+			expect(files.readText("plain.md")).toBe("hi");
+			expect(state.state.files["n.md"]).toMatchObject({
+				lazy: true,
+				remoteSize: 300,
+				baseBlobSha: await gitSha(await pointerOf(note)),
+				lfs: { oid: await oidOf(note), size: 300 },
+			});
+			expect(state.state.files["v.mp4"].lfs).toEqual({ oid: await oidOf(video), size: 500 });
+			// The small text blob is fetched once, not again for the write.
+			expect(gh.blobFetches.filter((s) => s === state.state.files["plain.md"].baseBlobSha)).toHaveLength(1);
+		});
+
+		it("does not refetch an unchanged pointer on later pulls", async () => {
+			const { gh, engine } = lfsEngine();
+			const p = await pointerOf(blob(500));
+			await gh.setFiles({ "v.mp4": p });
+			await engine.pull();
+			gh.blobFetches.length = 0;
+			await gh.setFiles({ "v.mp4": p, "x.md": "x" });
+			await engine.pull();
+			expect(gh.blobFetches).toEqual([await gitSha("x")]);
+		});
+
+		it("with LFS off, pointer text is pulled exactly as before", async () => {
+			const { gh, files, engine } = makeEngine();
+			const p = await pointerOf(blob(300));
+			await gh.setFiles({ "n.md": p });
+			await engine.pull();
+			expect(files.readText("n.md")).toBe(p);
+		});
+
+		it("adopts an untracked local copy that matches the remote pointer", async () => {
+			const { gh, files, state, engine } = lfsEngine();
+			await gh.setFiles({ "n.md": await pointerOf(blob(5)) });
+			await files.writeBinary("n.md", buf(blob(5)));
+			const summary = await engine.pull();
+			expect(summary.adopted).toBe(1);
+			expect(state.state.files["n.md"].lfs).toEqual({ oid: await oidOf(blob(5)), size: 5 });
+			expect(new Uint8Array(await files.readBinary("n.md"))).toEqual(blob(5));
+		});
+
+		it("never parks pointer text or text-merges on an LFS conflict", async () => {
+			const { gh, files, engine, logs } = await pushedLfsFile();
+			await files.writeBinary("big.bin", buf(blob(21, 4)));
+			await gh.setFiles({ ...Object.fromEntries([...gh.filesByPath].map(([p, f]) => [p, f.bytes])), "big.bin": await pointerOf(blob(22, 5)) });
+			const summary = await engine.pull();
+			expect(summary.conflicts).toBe(1);
+			expect(await files.stat("_conflicts/big.bin")).toBeNull();
+			expect(new Uint8Array(await files.readBinary("big.bin"))).toEqual(blob(21, 4));
+			expect(logs.some((l) => l.startsWith("warn:") && l.includes("conflict on big.bin"))).toBe(true);
+		});
+
+		it("never text-merges a text LFS file against its pointer", async () => {
+			const { gh, files, engine } = lfsEngine();
+			await gh.setFiles({ "n.md": "base" });
+			await engine.pull();
+			await files.writeBinary("n.md", text("base plus a long local edit"));
+			await engine.push(); // 27 bytes: through LFS
+			await files.writeBinary("n.md", text("base plus a long local edit, again"));
+			await gh.setFiles({ ...Object.fromEntries([...gh.filesByPath].map(([p, f]) => [p, f.bytes])), "n.md": "remote text" });
+			const summary = await engine.pull();
+			expect(summary.merged).toBe(0);
+			expect(summary.conflicts).toBe(1);
+			expect(files.readText("n.md")).toBe("base plus a long local edit, again");
+			expect(files.readText("_conflicts/n.md")).toBe("remote text");
+		});
+
+		it("tracks GitHub's new pointer for an LFS placeholder deleted here, then restores the stub", async () => {
+			const { gh, files, state, engine } = lfsEngine();
+			await gh.setFiles({ "v.mp4": await pointerOf(blob(500)) });
+			await engine.pull();
+			await files.remove("v.mp4");
+			const next = blob(600, 5);
+			await gh.setFiles({ "v.mp4": await pointerOf(next) });
+			await engine.pull();
+			expect(await files.stat("_conflicts/v.mp4")).toBeNull();
+			expect(state.state.files["v.mp4"]).toMatchObject({
+				lazy: true,
+				remoteSize: 600,
+				baseBlobSha: await gitSha(await pointerOf(next)),
+				lfs: { oid: await oidOf(next), size: 600 },
+			});
+			await engine.push();
+			expect((await files.stat("v.mp4"))?.size).toBe(0);
+		});
+	});
+
+	describe("placeholders", () => {
+		it("fetchLazy downloads through LFS and keeps the entry an LFS file", async () => {
+			const { gh, files, state, lfs, engine } = lfsEngine();
+			const real = blob(500, 9);
+			lfs.objects.set(await oidOf(real), real);
+			await gh.setFiles({ "v.mp4": await pointerOf(real) });
+			await engine.pull();
+			gh.blobFetches.length = 0;
+			expect(await engine.fetchLazy("v.mp4")).toBe("fetched");
+			expect(new Uint8Array(await files.readBinary("v.mp4"))).toEqual(real);
+			expect(lfs.downloads).toEqual([await oidOf(real)]);
+			expect(gh.blobFetches).toEqual([]);
+			expect(state.state.files["v.mp4"].lazy).toBeUndefined();
+			expect(state.state.files["v.mp4"].lfs).toEqual({ oid: await oidOf(real), size: 500 });
+			// Clean afterwards: nothing to push, and it can be evicted again.
+			expect((await engine.push()).commit).toBe(null);
+			expect(await engine.evict("v.mp4")).toBe("evicted");
+			expect(state.state.files["v.mp4"]).toMatchObject({ lazy: true, remoteSize: 500, lfs: { size: 500 } });
+		});
+
+		it("fetchLazy of an LFS placeholder fails clearly while LFS is off", async () => {
+			const env = lfsEngine();
+			await env.gh.setFiles({ "v.mp4": await pointerOf(blob(500)) });
+			await env.engine.pull();
+			await expect(lfsOff(env).engine.fetchLazy("v.mp4")).rejects.toThrow(/beta/);
+		});
+
+		it("revert restores an edited LFS file from LFS, never as pointer text", async () => {
+			const { files, lfs, engine } = await pushedLfsFile();
+			await files.writeBinary("big.bin", buf(blob(3, 1)));
+			expect(await engine.revert("big.bin")).toBe("reverted");
+			expect(new Uint8Array(await files.readBinary("big.bin"))).toEqual(blob(20));
+			expect(lfs.downloads).toHaveLength(1);
+		});
+
+		it("a push-side Keep of a deleted LFS file restores it as a placeholder", async () => {
+			const { files, state, engine } = await pushedLfsFile({
+				maxDeletions: 0,
+				confirmDeletions: async () => "keep",
+			});
+			await files.remove("big.bin");
+			await engine.push();
+			expect((await files.stat("big.bin"))?.size).toBe(0);
+			expect(state.state.files["big.bin"]).toMatchObject({ lazy: true, remoteSize: 20, lfs: { size: 20 } });
+		});
+
+		it("a placeholder's stub with a drifted mtime stays clean", async () => {
+			const { gh, files, engine } = lfsEngine();
+			await gh.setFiles({ "v.mp4": await pointerOf(blob(500)) });
+			await engine.pull();
+			files.mtimes.set("v.mp4", 999);
+			expect((await engine.push()).commit).toBe(null);
+		});
+	});
+
+	describe("preview", () => {
+		it("classifies LFS changes the way sync then applies them", async () => {
+			const { gh, files, engine } = await pushedLfsFile();
+			files.mtimes.set("big.bin", 999); // drift only: no row
+			await files.writeBinary("new.bin", buf(blob(30)));
+			await files.writeBinary("huge.bin", buf(blob(60)));
+			await gh.setFiles({ ...Object.fromEntries([...gh.filesByPath].map(([p, f]) => [p, f.bytes])), "n.md": await pointerOf(blob(300)) });
+			const plan = await engine.preview();
+			expect(plan.incoming).toEqual([{ path: "n.md", action: "placeholder" }]);
+			expect(plan.outgoing).toEqual([
+				{ path: "huge.bin", action: "skip-oversize", size: 60 },
+				{ path: "new.bin", action: "new" },
+			]);
 		});
 	});
 });
