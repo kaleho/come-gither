@@ -19,7 +19,9 @@ Real git implementations struggle on mobile with large repositories. Come Gither
 
 ## Network use disclosure
 
-This plugin sends the contents of your vault to the GitHub API (`api.github.com`) and downloads repository content from it. It talks to no other service. It collects no telemetry.
+This plugin sends the contents of your vault to the GitHub API (`api.github.com`) and downloads repository content from it. It collects no telemetry.
+
+The beta command *Test large file support* also contacts GitHub's Git LFS endpoint (`github.com`, `lfs.github.com`) and the storage URLs GitHub returns for the upload and download (currently Amazon S3 hosts run by GitHub). It runs only when beta features are on and you start the command. No other command talks to any other service.
 
 ## Token storage disclosure
 
@@ -54,6 +56,14 @@ Beta features are unfinished. Each one lists what it does and what it writes. Re
 - The ribbon icon menu, item *Show beta features*.
 
 While beta features are off, their commands do not show in the command palette or the ribbon menu.
+
+### Test large file support
+
+Checks whether this device and your token can send a file to GitHub's large file storage (Git LFS). Git LFS is the route for files over GitHub's 100 MB limit. You pick a vault file (largest first) and confirm. The command hashes the file, asks GitHub for an upload, uploads the file, verifies it, commits a pointer, and reads the start of the file back. It reports each step.
+
+What it writes: the chosen file goes to Git LFS in your repository and stays there. It counts toward your LFS storage (10 GiB included on Free and Pro). A pointer commit goes on a temporary branch, `come-gither-lfs-test`, and the command deletes the branch afterwards. Your sync branch does not change. This command also talks to `github.com` and GitHub's LFS storage, not only `api.github.com`.
+
+The results show in a window and go to the sync log. If a step fails, run **Export sync log** and share the note.
 
 ## Limits
 

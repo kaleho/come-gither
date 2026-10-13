@@ -81,3 +81,8 @@ export function formatSize(bytes: number): string {
 	const mb = bytes / 1048576;
 	return mb >= 1 ? `${mb.toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
 }
+
+/** The LFS test's file picker: non-empty items, largest first. */
+export function largestFirst<T extends { size: number }>(items: T[]): T[] {
+	return items.filter((i) => i.size > 0).sort((a, b) => b.size - a.size);
+}

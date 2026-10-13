@@ -4,6 +4,7 @@ import {
 	clampSyncMinutes,
 	confirmOrDefer,
 	formatSize,
+	largestFirst,
 	lowercaseHeaders,
 	maxDeletionsFor,
 	parentDirs,
@@ -141,5 +142,18 @@ describe("formatSize", () => {
 		expect(formatSize(1048575)).toBe("1024 KB");
 		expect(formatSize(2048)).toBe("2 KB");
 		expect(formatSize(1)).toBe("1 KB");
+	});
+});
+
+describe("largestFirst", () => {
+	it("drops empty items and sorts the rest by size, largest first, without mutating the input", () => {
+		const items = [
+			{ path: "a", size: 5 },
+			{ path: "empty", size: 0 },
+			{ path: "b", size: 50 },
+			{ path: "c", size: 7 },
+		];
+		expect(largestFirst(items).map((i) => i.path)).toEqual(["b", "c", "a"]);
+		expect(items[0].path).toBe("a");
 	});
 });
