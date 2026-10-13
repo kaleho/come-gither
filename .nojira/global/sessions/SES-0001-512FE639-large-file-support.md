@@ -48,6 +48,8 @@ iPad spike result (0.6.0 beta "Test large file support", 2026-10-13, user report
   - verify 200; download batch + Range 206, first 1 MiB matched.
 - Pointer commit 7928521 (unreachable now): pointer text and `.gitattributes` line are as specified; the contents API reports size=120087058 (the LFS size, not the 131-byte pointer). Recognition by the web UI / media host is still UNCONFIRMED: github.com/raw (token) and media.githubusercontent.com (token) both 404 for the unreachable private commit — inconclusive. Check it on the first real LFS commit on a live branch.
 
+0.7.0 beta LFS sync verified on the iPad (2026-10-13): push of the 114.5 MiB PDF via LFS in one commit with its .gitattributes line; GitHub web page shows "Stored with Git LFS" (closes the open pointer-recognition question); upload timer notice and download progress bar work; placeholder download opens the PDF. FEAT-0009 and FEAT-0010 done. See FEAT-0009 evidence RUN lfs-on-device-0-7-0.
+
 ## Decisions (in flight)
 
 ## Next
