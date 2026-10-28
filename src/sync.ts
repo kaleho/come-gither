@@ -168,7 +168,7 @@ export class SyncEngine {
 		}
 		const prev = this.chain;
 		const run = (async () => {
-			await prev.catch(() => {});
+			await prev; // never rejects: chain only ever holds run.catch(...)
 			return fn();
 		})();
 		this.chain = run.catch(() => {});

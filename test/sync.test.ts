@@ -1378,6 +1378,14 @@ describe("placeholder drift", () => {
 		expect(await engine.fetchLazy("big.pdf")).toBe("fetched");
 		expect((await files.stat("big.pdf"))?.size).toBe(3);
 	});
+
+	it("previews a stub whose mtime drifted as clean", async () => {
+		const { gh, files, engine } = makeEngine();
+		await gh.setFiles({ "big.pdf": new Uint8Array([1, 2, 3]) });
+		await engine.pull();
+		await files.writeBinary("big.pdf", new ArrayBuffer(0));
+		expect((await engine.preview()).outgoing).toEqual([]);
+	});
 });
 
 describe("overwrite safety under remote-wins", () => {
