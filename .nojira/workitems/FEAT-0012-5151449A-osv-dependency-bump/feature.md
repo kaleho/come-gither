@@ -1,8 +1,8 @@
 ---
 id: FEAT-0012-5151449A
-status: in-progress
+status: done
 created: '2026-10-28T12:54:56+00:00'
-updated: '2026-10-28T12:54:59+00:00'
+updated: '2026-10-28T12:58:30+00:00'
 advances: []
 verifies: []
 derived_from: []
