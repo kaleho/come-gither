@@ -32,6 +32,17 @@ describe("RingLogger", () => {
 		expect(files.readText(PATH)).toContain("fifth");
 	});
 
+	it("swallows a failed automatic flush", async () => {
+		const files = new MemFiles();
+		files.writeBinary = async () => {
+			throw new Error("disk full");
+		};
+		const logger = new RingLogger(files, PATH, { flushEvery: 1, now: () => 0 });
+		expect(() => logger.log("info", "x")).not.toThrow();
+		await new Promise((r) => setTimeout(r, 0));
+		expect(logger.dump()).toContain("info x");
+	});
+
 	it("flush writes the current buffer to the log file", async () => {
 		const files = new MemFiles();
 		const logger = new RingLogger(files, PATH, { now: () => 0 });
@@ -84,6 +95,15 @@ describe("RingLogger", () => {
 		logger.log("info", "x");
 		expect(logger.dump()).toContain("info x");
 		expect(logger.dump()).not.toContain("session start");
+	});
+
+	it("init adds no session marker for an empty previous log", async () => {
+		const files = new MemFiles();
+		files.writeText(PATH, "");
+		const logger = new RingLogger(files, PATH, { now: () => 0 });
+		await logger.init();
+		logger.log("info", "x");
+		expect(logger.dump()).toBe("1970-01-01T00:00:00.000Z info x");
 	});
 
 	it("uses the real clock when none is injected", async () => {
